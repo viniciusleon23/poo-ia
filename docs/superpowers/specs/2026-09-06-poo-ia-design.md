@@ -1,7 +1,7 @@
 # Poo-IA: diseño del bot de Discord con Ollama
 
 **Fecha:** 2026-09-06  
-**Estado:** aprobado para revisión de especificación
+**Estado:** aprobado para implementación
 
 ## Objetivo
 

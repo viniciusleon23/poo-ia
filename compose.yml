@@ -1,0 +1,12 @@
+services:
+  discord-bot:
+    build: .
+    image: poo-ia:local
+    container_name: poo-ia-discord
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./rules:/app/rules:ro
+      - ./personality:/app/personality:ro

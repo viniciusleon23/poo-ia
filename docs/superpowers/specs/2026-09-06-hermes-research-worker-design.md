@@ -1,7 +1,11 @@
 # Poo-IA: diseño del cerebro de consulta con Hermes
 
 **Fecha:** 2026-09-06
-**Estado:** pendiente de revisión antes de implementar
+**Estado:** reemplazado por `2026-09-06-opencode-research-worker-design.md`
+
+> Este diseño se conserva como registro de la alternativa evaluada. La decisión
+> vigente es usar OpenCode como worker de consulta para aprovechar la suscripción
+> de Codex ahora y permitir una migración directa a OpenCode Go después.
 
 ## Objetivo
 

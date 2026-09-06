@@ -1,9 +1,13 @@
 .git
 .env
 .env.*
+*.env
+*.env.*
 !.env.example
+!*.env.example
 venv
 .venv
+.venv-worker
 __pycache__
 *.py[cod]
 .pytest_cache
@@ -12,3 +16,18 @@ htmlcov
 docs
 tests
 work
+
+# Host-only worker and deployment assets are not part of the Discord image
+worker
+ops
+requirements-worker.txt
+
+# Durable/runtime state must never enter an image build context
+data
+*.sqlite3
+*.sqlite3-*
+*.log
+*.jsonl
+*.pid
+capnet-worktrees
+worker-state

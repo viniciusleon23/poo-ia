@@ -5,8 +5,16 @@ services:
     container_name: poo-ia-discord
     restart: unless-stopped
     network_mode: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     env_file:
       - .env
     volumes:
       - ./rules:/app/rules:ro
       - ./personality:/app/personality:ro
+      - poo-ia-data:/app/data
+
+volumes:
+  poo-ia-data:

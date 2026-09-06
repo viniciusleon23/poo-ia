@@ -1,0 +1,30 @@
+[Unit]
+Description=Poo-IA local Codex and GitHub worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/poo/poo-ia
+Environment=HOME=/home/poo
+Environment=PATH=/home/poo/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/home/poo/.config/poo-ia/worker.env
+ExecStart=/home/poo/poo-ia/.venv-worker/bin/python -m worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=process
+UMask=0077
+MemoryMax=2G
+TasksMax=256
+CPUQuota=200%
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target

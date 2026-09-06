@@ -5,16 +5,18 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/poo/capnet-workspace
-Environment=HOME=/home/poo
+WorkingDirectory=-/home/poo/capnet-research-view
+Environment=HOME=/home/poo/.local/share/poo-ia-opencode-home
 Environment=PATH=/home/poo/.opencode/bin:/usr/local/bin:/usr/bin:/bin
 Environment=OPENCODE_CONFIG=/home/poo/poo-ia/opencode/opencode.jsonc
 Environment=OPENCODE_CONFIG_DIR=/home/poo/poo-ia/opencode
 Environment=OPENCODE_DISABLE_AUTOUPDATE=true
 EnvironmentFile=/home/poo/.config/poo-ia/opencode-server.env
+ExecStartPre=/usr/bin/python3 /home/poo/poo-ia/worker/research_view.py --source /home/poo/capnet-workspace --target /home/poo/capnet-research-view
 ExecStart=/home/poo/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4096
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=10min
 TimeoutStopSec=30
 UMask=0077
 NoNewPrivileges=true
@@ -23,6 +25,11 @@ ProtectSystem=full
 ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
+MemoryMax=2G
+TasksMax=128
+CPUQuota=200%
+LimitCORE=0
+LimitNOFILE=4096
 
 [Install]
 WantedBy=default.target

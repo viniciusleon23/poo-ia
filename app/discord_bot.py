@@ -9,6 +9,9 @@ import aiohttp
 import discord
 
 from .config import Settings
+from .instance_lock import InstanceLock
+from .memory import MemoryStore
+from .models import ConversationKey, InboundMessage, OutboxPart
 from .ollama_client import OllamaClient, OllamaError
 from .opencode_client import (
     OpenCodeClient,
@@ -18,10 +21,14 @@ from .opencode_client import (
 )
 from .prompt_loader import build_prompt, load_prompt_context
 from .router import Backend, choose_backend
-from .text import split_for_discord
+from .orchestrator import PROCESSING_FAILED_MESSAGE, PooIAOrchestrator
+from .outbox import DurableOutbox
+from .storage import SQLiteStorage
+from .worker_client import WorkerClient, WorkerError
 
 
 LOGGER = logging.getLogger(__name__)
+DISCORD_DELIVERY_BACKOFF_SECONDS = 2
 OLLAMA_UNAVAILABLE_MESSAGE = "No pude obtener una respuesta de Ollama. Inténtalo de nuevo en un momento."
 OPENCODE_DISABLED_MESSAGE = "El cerebro documental todavía no está habilitado. Inténtalo más tarde."
 OPENCODE_TIMEOUT_MESSAGE = "La consulta documental tardó demasiado. Inténtalo de nuevo en un momento."
@@ -65,7 +72,7 @@ async def generate_response(
 
 
 class PooIAClient(discord.Client):
-    """A Discord client that forwards allowed messages to local Ollama."""
+    """Thin Discord adapter over the transport-neutral Poo-IA core."""
 
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -74,8 +81,18 @@ class PooIAClient(discord.Client):
         self.settings = settings
         self._ollama_session: aiohttp.ClientSession | None = None
         self._opencode_session: aiohttp.ClientSession | None = None
+        self._worker_session: aiohttp.ClientSession | None = None
         self._ollama: OllamaClient | None = None
         self._opencode: OpenCodeClient | None = None
+        self._worker: WorkerClient | None = None
+        self._storage: SQLiteStorage | None = None
+        self._instance_lock: InstanceLock | None = None
+        self._orchestrator: PooIAOrchestrator | None = None
+        self._delivery_task: asyncio.Task[None] | None = None
+        self._delivery_lock = asyncio.Lock()
+        self._repository_refresh_lock = asyncio.Lock()
+        self._next_repository_refresh = 0.0
+        self._next_storage_prune = 0.0
         self._opencode_semaphore = asyncio.Semaphore(settings.opencode_max_concurrent)
 
     async def setup_hook(self) -> None:
@@ -103,52 +120,234 @@ class PooIAClient(discord.Client):
                 agent=self.settings.opencode_agent,
             )
 
+        repositories: tuple[str, ...] = ()
+        if self.settings.worker_enabled:
+            password = self.settings.worker_server_password
+            if password is None:
+                raise RuntimeError("The worker was enabled without a server password.")
+            worker_timeout = aiohttp.ClientTimeout(
+                total=self.settings.worker_timeout_seconds
+            )
+            self._worker_session = aiohttp.ClientSession(timeout=worker_timeout)
+            self._worker = WorkerClient(
+                self._worker_session,
+                base_url=self.settings.worker_base_url,
+                username=self.settings.worker_server_username,
+                password=password,
+            )
+            try:
+                await self._worker.health()
+                repositories = await self._worker.list_repositories()
+            except WorkerError as error:
+                # Conversation and documentation still work while the host worker
+                # is temporarily unavailable. Its next operation will report the
+                # recoverable error through the durable job result.
+                LOGGER.warning("Host worker startup check failed: %s", error)
+
+        self._instance_lock = InstanceLock.for_database(self.settings.database_path)
+        try:
+            self._storage = SQLiteStorage(self.settings.database_path)
+        except Exception:
+            self._instance_lock.close()
+            self._instance_lock = None
+            raise
+        self._storage.prune(
+            memory_retention_seconds=self.settings.memory_retention_days * 86_400,
+            operational_retention_seconds=(
+                self.settings.operational_retention_days * 86_400
+            ),
+        )
+        memory = MemoryStore(
+            self._storage,
+            retention_days=self.settings.memory_retention_days,
+            max_exchanges=self.settings.memory_max_exchanges,
+            max_context_chars=self.settings.memory_max_context_chars,
+        )
+        outbox = DurableOutbox(self._storage)
+        self._orchestrator = PooIAOrchestrator(
+            storage=self._storage,
+            memory=memory,
+            outbox=outbox,
+            ollama=self._ollama,
+            content_root=self.settings.content_root,
+            opencode=self._opencode,
+            worker=self._worker,
+            repositories=repositories,
+            worker_poll_seconds=self.settings.worker_poll_seconds,
+        )
+        self._next_repository_refresh = asyncio.get_running_loop().time() + 60
+        self._next_storage_prune = asyncio.get_running_loop().time() + 3_600
+        await self._orchestrator.start()
+
     async def close(self) -> None:
-        for session in (self._ollama_session, self._opencode_session):
+        delivery_task = self._delivery_task
+        if delivery_task is not None:
+            delivery_task.cancel()
+            try:
+                await delivery_task
+            except asyncio.CancelledError:
+                pass
+            self._delivery_task = None
+        if self._orchestrator is not None:
+            await self._orchestrator.close()
+        for session in (
+            self._ollama_session,
+            self._opencode_session,
+            self._worker_session,
+        ):
             if session is not None and not session.closed:
                 await session.close()
+        if self._storage is not None:
+            self._storage.close()
+        if self._instance_lock is not None:
+            self._instance_lock.close()
+            self._instance_lock = None
         await super().close()
 
     async def on_ready(self) -> None:
         LOGGER.info(
-            "Connected as %s; listening only to channel %s.",
+            "Connected as %s; listening only to channel %s and owner %s.",
             self.user,
             self.settings.discord_channel_id,
+            self.settings.allowed_user_id,
         )
+        if self._delivery_task is None or self._delivery_task.done():
+            self._delivery_task = asyncio.create_task(
+                self._delivery_loop(), name="poo-ia-discord-outbox"
+            )
+        await self._flush_pending()
 
     async def on_message(self, message: discord.Message) -> None:
         if not should_respond_to(message, self.settings):
             return
 
-        ollama = self._ollama
-        if ollama is None:
-            LOGGER.error("Ollama client was not initialized before receiving a message.")
+        orchestrator = self._orchestrator
+        if orchestrator is None:
+            LOGGER.error("Poo-IA core was not initialized before receiving a message.")
             return
 
-        async with message.channel.typing():
+        inbound = InboundMessage(
+            message_id=message.id,
+            channel_id=message.channel.id,
+            user_id=message.author.id,
+            text=message.content,
+        )
+        try:
+            if self._worker is not None and not orchestrator.repositories:
+                await self._refresh_worker_repositories(force=True)
+            async with message.channel.typing():
+                await orchestrator.handle(inbound)
+        except Exception as error:
+            LOGGER.exception("Failed to process Discord message %s: %s", message.id, error)
             try:
-                generated_text = await generate_response(
-                    message.content,
-                    self.settings,
-                    ollama=ollama,
-                    opencode=self._opencode,
-                    opencode_semaphore=self._opencode_semaphore,
+                await orchestrator.record_processing_failure(
+                    inbound, safe_message=PROCESSING_FAILED_MESSAGE
                 )
-            except OllamaError as error:
-                LOGGER.warning("Ollama generation failed: %s", error)
-                await message.channel.send(OLLAMA_UNAVAILABLE_MESSAGE)
+            except Exception as durable_error:
+                # SQLite/outbox itself is unavailable. This is the only direct,
+                # non-durable fallback so the owner is not left without feedback.
+                LOGGER.exception(
+                    "Could not persist failure for Discord message %s: %s",
+                    message.id,
+                    durable_error,
+                )
+                try:
+                    await message.channel.send(PROCESSING_FAILED_MESSAGE)
+                except Exception as delivery_error:
+                    LOGGER.warning(
+                        "Last-resort Discord failure delivery also failed: %s",
+                        delivery_error,
+                    )
                 return
-            except OpenCodeDisabledError:
-                await message.channel.send(OPENCODE_DISABLED_MESSAGE)
-                return
-            except OpenCodeTimeoutError as error:
-                LOGGER.warning("OpenCode research timed out: %s", error)
-                await message.channel.send(OPENCODE_TIMEOUT_MESSAGE)
-                return
-            except OpenCodeError as error:
-                LOGGER.warning("OpenCode research failed: %s", error)
-                await message.channel.send(OPENCODE_UNAVAILABLE_MESSAGE)
-                return
+            try:
+                await self._flush_pending(inbound.conversation_key)
+            except Exception as delivery_error:
+                # The durable delivery loop will retry this recorded failure.
+                LOGGER.warning(
+                    "Durable processing-failure delivery will retry: %s",
+                    delivery_error,
+                )
+            return
+        try:
+            await self._flush_pending(inbound.conversation_key)
+        except Exception as error:
+            # The output is still pending in SQLite and the delivery loop will
+            # retry it. Do not add an untracked fallback message here.
+            LOGGER.warning("Initial durable Discord delivery failed: %s", error)
 
-        for chunk in split_for_discord(generated_text):
-            await message.channel.send(chunk)
+    async def _delivery_loop(self) -> None:
+        """Wake for durable outputs produced after an inbound handler returned."""
+        orchestrator = self._orchestrator
+        if orchestrator is None:
+            return
+        while not self.is_closed():
+            try:
+                self._prune_storage_if_due()
+                await self._refresh_worker_repositories()
+                available = await orchestrator.wait_for_output(timeout=30)
+                if not available:
+                    continue
+                if not self.is_ready():
+                    await asyncio.sleep(DISCORD_DELIVERY_BACKOFF_SECONDS)
+                    continue
+                await self._flush_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                LOGGER.warning("Durable Discord delivery failed and will retry: %s", error)
+                await asyncio.sleep(2)
+
+    def _prune_storage_if_due(self) -> bool:
+        """Apply bounded retention hourly while a long-lived bot stays online."""
+        storage = self._storage
+        if storage is None:
+            return False
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._next_storage_prune:
+            return False
+        self._next_storage_prune = loop.time() + 3_600
+        storage.prune(
+            memory_retention_seconds=self.settings.memory_retention_days * 86_400,
+            operational_retention_seconds=(
+                self.settings.operational_retention_days * 86_400
+            ),
+        )
+        return True
+
+    async def _refresh_worker_repositories(self, *, force: bool = False) -> bool:
+        """Refresh late/stale host inventory without requiring a bot restart."""
+        worker = self._worker
+        orchestrator = self._orchestrator
+        if worker is None or orchestrator is None:
+            return False
+        loop = asyncio.get_running_loop()
+        if not force and loop.time() < self._next_repository_refresh:
+            return False
+        async with self._repository_refresh_lock:
+            if not force and loop.time() < self._next_repository_refresh:
+                return False
+            self._next_repository_refresh = loop.time() + 60
+            try:
+                repositories = await worker.list_repositories()
+            except WorkerError as error:
+                LOGGER.debug("Could not refresh host repository inventory: %s", error)
+                return False
+            orchestrator.set_repositories(repositories)
+            return True
+
+    async def _flush_pending(self, key: ConversationKey | None = None) -> int:
+        orchestrator = self._orchestrator
+        if orchestrator is None:
+            return 0
+        async with self._delivery_lock:
+            return await orchestrator.flush_outputs(self._send_outbox_part, key=key)
+
+    async def _send_outbox_part(self, part: OutboxPart) -> discord.Message:
+        channel_id = int(part.channel_id)
+        channel = self.get_channel(channel_id)
+        if channel is None:
+            channel = await self.fetch_channel(channel_id)
+        sender = getattr(channel, "send", None)
+        if sender is None:
+            raise RuntimeError(f"Discord channel {channel_id} cannot receive messages.")
+        return await sender(part.content)

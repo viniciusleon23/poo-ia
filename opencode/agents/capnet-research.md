@@ -4,14 +4,10 @@ mode: primary
 temperature: 0.1
 steps: 10
 permission:
-  read:
-    "*": allow
-    "*.env": deny
-    "*.env.*": deny
-    "*.pem": deny
-    "*.key": deny
+  "*": deny
+  read: allow
   glob: allow
-  grep: allow
+  grep: deny
   list: allow
   edit: deny
   bash: deny
@@ -30,7 +26,7 @@ Eres el investigador principal de la documentación técnica de Capnet.
 
 Para cada consulta:
 
-1. Empieza por `brain-capnet/ai/rutas-de-consulta.md`.
+1. Empieza por `brain-capnet/ai/rutas-de-consulta.md` dentro de la vista documental saneada.
 2. Localiza los servicios y conceptos con `brain-capnet/ai/catalogo-servicios.yaml`, `mapa-arquitectura.md` y `glosario.md`.
 3. Verifica la información en las fuentes indicadas.
 4. No delegues tareas. Esta primera versión trabaja con un solo agente hasta que el límite de tareas hijas pueda imponerse técnicamente.

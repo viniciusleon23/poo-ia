@@ -1,11 +1,15 @@
 # Secrets and local configuration
 .env
 .env.*
+*.env
+*.env.*
 !.env.example
+!*.env.example
 
 # Python environments and generated files
 venv/
 .venv/
+.venv-worker/
 __pycache__/
 *.py[cod]
 *.so
@@ -14,6 +18,16 @@ __pycache__/
 coverage.xml
 htmlcov/
 work/
+
+# Runtime state and private operational artifacts
+data/
+*.sqlite3
+*.sqlite3-*
+*.log
+*.jsonl
+*.pid
+capnet-worktrees/
+worker-state/
 
 # Editors and operating systems
 .DS_Store

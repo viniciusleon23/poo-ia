@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.prompt_loader import build_prompt, load_prompt_context
+from app.prompt_loader import build_prompt, build_research_prompt, load_prompt_context
 
 
 class PromptLoaderTests(unittest.TestCase):
@@ -36,3 +36,38 @@ class PromptLoaderTests(unittest.TestCase):
         self.assertIn("Regla útil", prompt)
         self.assertIn("## Mensaje del usuario\n\nHola, Poo-IA", prompt)
         self.assertTrue(prompt.endswith("## Respuesta"))
+
+    def test_build_prompt_delimits_completed_history_and_active_repository(self) -> None:
+        history = "Usuario: revisa tasks\nAsistente: Está en schemas/base_response.py"
+
+        prompt = build_prompt(
+            "Regla útil",
+            "agrégalo",
+            conversation_context=history,
+            active_repository="capnet-next-lambda-tasks",
+        )
+
+        self.assertIn("<poo-ia-conversation-context>", prompt)
+        self.assertIn(history, prompt)
+        self.assertIn("</poo-ia-conversation-context>", prompt)
+        self.assertIn(
+            "<poo-ia-active-repository>capnet-next-lambda-tasks"
+            "</poo-ia-active-repository>",
+            prompt,
+        )
+        self.assertLess(prompt.index(history), prompt.index("agrégalo"))
+
+    def test_build_research_prompt_includes_rules_context_and_read_only_boundary(self) -> None:
+        prompt = build_research_prompt(
+            "Cita rutas concretas.",
+            "¿Dónde se define task_available?",
+            conversation_context="Usuario: hablamos de tasks",
+            active_repository="capnet-next-lambda-tasks",
+        )
+
+        self.assertIn("modo de solo lectura", prompt)
+        self.assertIn("Cita rutas concretas.", prompt)
+        self.assertIn("Usuario: hablamos de tasks", prompt)
+        self.assertIn("capnet-next-lambda-tasks", prompt)
+        self.assertIn("<poo-ia-current-request>", prompt)
+        self.assertTrue(prompt.endswith("## Respuesta documental"))

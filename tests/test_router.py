@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import unittest
 
-from app.router import Backend, choose_backend
+from app.models import Backend, Intent
+from app.router import (
+    AMBIGUOUS_REPOSITORY,
+    AWS_DISABLED,
+    REPOSITORY_REQUIRED,
+    choose_backend,
+    classify_intent,
+    route_message,
+)
 
 
 class RouterTests(unittest.TestCase):
@@ -34,3 +42,115 @@ class RouterTests(unittest.TestCase):
         for message in messages:
             with self.subTest(message=message):
                 self.assertEqual(choose_backend(message), Backend.OPENCODE)
+
+    def test_classifies_all_deterministic_control_intents(self) -> None:
+        cases = {
+            "olvida la conversación": Intent.FORGET,
+            "¿Cómo va el trabajo?": Intent.JOB_STATUS,
+            "cancela ese trabajo": Intent.CANCEL,
+            "agrega task_available en el repo capnet-next-lambda-tasks": Intent.CODE_CHANGE,
+            "haz el cambio y arma el PR": Intent.PULL_REQUEST,
+            "Hecho, agrégalo y arma el PR": Intent.PULL_REQUEST,
+            "consulta DynamoDB y prepara un informe": Intent.AWS_REPORT,
+            "hola": Intent.CHAT,
+            "¿qué servicios usan task_available?": Intent.RESEARCH,
+        }
+
+        for message, intent in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(classify_intent(message), intent)
+
+    def test_informational_change_question_does_not_authorize_mutation(self) -> None:
+        messages = (
+            "¿Cómo puedo agregar un campo en Pydantic?",
+            "Me explicas qué implica cambiar ese endpoint",
+            "¿Qué crea este método?",
+            "¿Qué es un PR?",
+            "¿Para qué sirve el trabajo de reconciliación?",
+            "¿Cómo va a funcionar el nuevo servicio?",
+            "necesito saber cómo crear un PR",
+            "puedes explicarme cómo abrir un pull request",
+        )
+
+        for message in messages:
+            with self.subTest(message=message):
+                self.assertEqual(classify_intent(message), Intent.RESEARCH)
+
+    def test_aws_route_cannot_be_bypassed_by_pr_language(self) -> None:
+        decision = route_message(
+            "crea un PR para consultar DynamoDB",
+            active_repository="capnet-next-lambda-tasks",
+            active_job_id="prepared-job-123",
+        )
+
+        self.assertEqual(decision.intent, Intent.AWS_REPORT)
+        self.assertEqual(decision.backend, Backend.NONE)
+        self.assertEqual(decision.reason, AWS_DISABLED)
+
+    def test_returns_deterministic_aws_disabled_route(self) -> None:
+        decision = route_message("saca un reporte de las tablas DynamoDB")
+
+        self.assertEqual(decision.intent, Intent.AWS_REPORT)
+        self.assertEqual(decision.backend, Backend.NONE)
+        self.assertEqual(decision.reason, AWS_DISABLED)
+
+    def test_resolves_explicit_and_follow_up_repositories(self) -> None:
+        repositories = ("capnet-next-lambda-tasks", "customer-service")
+
+        explicit = route_message(
+            "agrega task_available en capnet-next-lambda-tasks",
+            repositories=repositories,
+        )
+        follow_up = route_message(
+            "hazlo",
+            active_repository="capnet-next-lambda-tasks",
+        )
+
+        self.assertEqual(explicit.intent, Intent.CODE_CHANGE)
+        self.assertEqual(explicit.backend, Backend.WORKER)
+        self.assertEqual(explicit.repository, "capnet-next-lambda-tasks")
+        self.assertEqual(follow_up.intent, Intent.CODE_CHANGE)
+        self.assertEqual(follow_up.repository, "capnet-next-lambda-tasks")
+
+    def test_natural_pronominal_follow_up_uses_remembered_repository(self) -> None:
+        for message in ("agrégalo", "añádelo", "modifícalo", "corrígelo"):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message,
+                    active_repository="capnet-next-lambda-tasks",
+                )
+
+                self.assertEqual(decision.intent, Intent.CODE_CHANGE)
+                self.assertEqual(decision.backend, Backend.WORKER)
+                self.assertEqual(decision.repository, "capnet-next-lambda-tasks")
+
+    def test_mutable_request_without_unique_repository_requests_clarification(self) -> None:
+        missing = route_message("agrega el campo task_available")
+        ambiguous = route_message(
+            "actualiza foo y bar",
+            repositories=("foo", "bar"),
+        )
+
+        self.assertEqual(missing.intent, Intent.CLARIFY)
+        self.assertEqual(missing.backend, Backend.NONE)
+        self.assertEqual(missing.reason, REPOSITORY_REQUIRED)
+        self.assertEqual(ambiguous.intent, Intent.CLARIFY)
+        self.assertEqual(ambiguous.reason, AMBIGUOUS_REPOSITORY)
+
+    def test_uses_active_or_explicit_job_for_status_cancel_and_pr(self) -> None:
+        active_status = route_message("cómo va", active_job_id="job-active-123")
+        explicit_cancel = route_message("cancela el trabajo ABC123")
+        explicit_pr = route_message("arma el PR del trabajo ABC123")
+
+        self.assertEqual(active_status.job_id, "job-active-123")
+        self.assertEqual(explicit_cancel.intent, Intent.CANCEL)
+        self.assertEqual(explicit_cancel.job_id, "ABC123")
+        self.assertEqual(explicit_pr.intent, Intent.PULL_REQUEST)
+        self.assertEqual(explicit_pr.backend, Backend.WORKER)
+        self.assertEqual(explicit_pr.job_id, "ABC123")
+
+    def test_unknown_technical_request_defaults_to_read_only_research(self) -> None:
+        decision = route_message("analiza por qué falla el servicio de clientes")
+
+        self.assertEqual(decision.intent, Intent.RESEARCH)
+        self.assertEqual(decision.backend, Backend.OPENCODE)

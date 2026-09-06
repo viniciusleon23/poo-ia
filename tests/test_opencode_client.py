@@ -24,6 +24,17 @@ class FakeResponse:
         return self._data
 
 
+class BlockingResponse(FakeResponse):
+    def __init__(self, started: asyncio.Event) -> None:
+        super().__init__(200, {})
+        self._started = started
+
+    async def json(self, **_kwargs: object) -> object:
+        self._started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
 class FakeSession:
     def __init__(self, responses: list[FakeResponse | Exception]) -> None:
         self.responses = responses
@@ -126,3 +137,115 @@ class OpenCodeClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(OpenCodeTimeoutError, "Timed out"):
             await self.make_client(session).research("consulta")
+
+    async def test_timeout_after_creation_aborts_before_deleting(self) -> None:
+        session = FakeSession(
+            [
+                FakeResponse(200, {"id": "session-timeout"}),
+                asyncio.TimeoutError(),
+                FakeResponse(200, True),
+                FakeResponse(200, True),
+            ]
+        )
+
+        with self.assertRaises(OpenCodeTimeoutError):
+            await self.make_client(session).research("consulta")
+
+        self.assertEqual(
+            [(method, url.rsplit("/", 1)[-1]) for method, url, _ in session.calls],
+            [
+                ("POST", "session"),
+                ("POST", "message"),
+                ("POST", "abort"),
+                ("DELETE", "session-timeout"),
+            ],
+        )
+
+    async def test_cancelled_research_aborts_before_delete_and_clears_active_id(self) -> None:
+        started = asyncio.Event()
+        session = FakeSession(
+            [
+                FakeResponse(200, {"id": "session-cancel"}),
+                BlockingResponse(started),
+                FakeResponse(200, True),
+                FakeResponse(200, True),
+            ]
+        )
+        client = self.make_client(session)
+        observed_sessions: list[str] = []
+        task = asyncio.create_task(
+            client.research("consulta", on_session_created=observed_sessions.append)
+        )
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        self.assertEqual(client.active_session_id, "session-cancel")
+        self.assertEqual(observed_sessions, ["session-cancel"])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(client.active_session_id, None)
+        self.assertEqual([call[0] for call in session.calls], ["POST", "POST", "POST", "DELETE"])
+        self.assertTrue(session.calls[2][1].endswith("/session/session-cancel/abort"))
+        self.assertTrue(session.calls[3][1].endswith("/session/session-cancel"))
+
+    async def test_formats_optional_context_without_breaking_simple_research_api(self) -> None:
+        session = FakeSession(
+            [
+                FakeResponse(200, {"id": "session-context"}),
+                FakeResponse(200, {"parts": [{"type": "text", "text": "resultado"}]}),
+                FakeResponse(200, True),
+            ]
+        )
+
+        result = await self.make_client(session).research(
+            "¿Dónde está task_available?",
+            instructions="Cita rutas.",
+            conversation_context="Usuario: revisa el schema",
+            active_repository="capnet-next-lambda-tasks",
+        )
+
+        self.assertEqual(result, "resultado")
+        sent_prompt = session.calls[1][2]["json"]["parts"][0]["text"]
+        self.assertIn("Cita rutas.", sent_prompt)
+        self.assertIn("Usuario: revisa el schema", sent_prompt)
+        self.assertIn("capnet-next-lambda-tasks", sent_prompt)
+        self.assertIn("¿Dónde está task_available?", sent_prompt)
+
+    async def test_recovery_cleanup_reports_delete_failure_instead_of_losing_session(self) -> None:
+        session = FakeSession(
+            [
+                FakeResponse(200, True),
+                FakeResponse(503, {}),
+            ]
+        )
+
+        with self.assertRaisesRegex(OpenCodeError, "delete.*HTTP 503"):
+            await self.make_client(session).cleanup_session("orphan-session")
+
+        self.assertEqual([call[0] for call in session.calls], ["POST", "DELETE"])
+
+    async def test_recovery_cleanup_accepts_already_deleted_session(self) -> None:
+        session = FakeSession(
+            [
+                FakeResponse(404, {}),
+                FakeResponse(404, {}),
+            ]
+        )
+
+        await self.make_client(session).cleanup_session("orphan-session")
+
+        self.assertEqual([call[0] for call in session.calls], ["POST", "DELETE"])
+        self.assertEqual(session.calls[0][2]["timeout"].total, 5.0)
+        self.assertEqual(session.calls[1][2]["timeout"].total, 5.0)
+
+    def test_rejects_nonpositive_cleanup_request_timeout(self) -> None:
+        with self.assertRaises(ValueError):
+            OpenCodeClient(
+                FakeSession([]),
+                base_url="http://127.0.0.1:4096",
+                username="opencode",
+                password="secret",
+                agent="capnet-research",
+                cleanup_request_timeout_seconds=0,
+            )

@@ -28,6 +28,13 @@ from .models import (
 )
 from .outbox import DurableOutbox
 from .prompt_loader import build_prompt, load_prompt_context
+from .preflight import build_preflight_request, parse_preflight
+from .repository_scope import (
+    DOCUMENTATION_REPOSITORY_READ_ONLY,
+    UNKNOWN_REPOSITORY,
+    is_documentation_repository,
+    mentioned_execution_repositories,
+)
 from .router import (
     AMBIGUOUS_REPOSITORY,
     REPOSITORY_REQUIRED,
@@ -340,6 +347,8 @@ class PooIAOrchestrator:
                 active_repository = self._mentioned_repository(message.text)
                 if active_repository is None:
                     active_repository = snapshot.conversation.active_repository
+            if is_documentation_repository(active_repository):
+                active_repository = None
 
             job_kind: JobKind | None = None
             job_payload: dict[str, Any] | None = None
@@ -388,12 +397,18 @@ class PooIAOrchestrator:
                     codex_target = self._codex_target(target_job)
                     if codex_target is not None:
                         target_job = codex_target
-                        job_kind = JobKind.PUBLISH
-                        job_payload = {
-                            "target_job_id": target_job.job_id,
-                            "override": self._requests_override(message.text),
-                        }
-                        active_repository = target_job.repository
+                        explicit_targets = mentioned_execution_repositories(message.text, self.repositories)
+                        if is_documentation_repository(target_job.repository):
+                            decision = RouteDecision(Intent.CLARIFY, Backend.NONE, reason=DOCUMENTATION_REPOSITORY_READ_ONLY)
+                        elif explicit_targets and target_job.repository not in explicit_targets:
+                            decision = RouteDecision(Intent.CLARIFY, Backend.NONE, reason="REPOSITORY_JOB_MISMATCH")
+                        else:
+                            job_kind = JobKind.PUBLISH
+                            job_payload = {
+                                "target_job_id": target_job.job_id,
+                                "override": self._requests_override(message.text),
+                            }
+                            active_repository = target_job.repository
 
             registration = self.storage.register_inbound(
                 message,
@@ -537,12 +552,15 @@ class PooIAOrchestrator:
                 request.request_id, AWS_DISABLED_MESSAGE, remember=False
             )
         elif intent is Intent.CLARIFY:
-            text = (
-                AMBIGUOUS_REPOSITORY_MESSAGE
-                if decision.intent is Intent.CLARIFY
-                and decision.reason == AMBIGUOUS_REPOSITORY
-                else REPOSITORY_REQUIRED_MESSAGE
-            )
+            text = {
+                AMBIGUOUS_REPOSITORY: AMBIGUOUS_REPOSITORY_MESSAGE,
+                DOCUMENTATION_REPOSITORY_READ_ONLY: (
+                    "El brain es una fuente de documentación, no un repositorio de ejecución. "
+                    "Indica el servicio que debo modificar; el proceso se documentará después en el brain."
+                ),
+                UNKNOWN_REPOSITORY: "Ese repositorio no está disponible para ejecución. Indica uno del inventario del worker.",
+                "REPOSITORY_JOB_MISMATCH": "El trabajo indicado pertenece a otro repositorio. El PR debe publicarse en su repositorio de ejecución original.",
+            }.get(decision.reason, REPOSITORY_REQUIRED_MESSAGE)
             self._enqueue_direct(
                 request.request_id, text, backend=Backend.NONE, remember=True
             )
@@ -560,6 +578,15 @@ class PooIAOrchestrator:
                 conversation_context,
                 active_repository,
             )
+        elif intent is Intent.CAPABILITIES:
+            text = (
+                "Puedo leer la documentación del brain y preparar cambios en un repositorio de ejecución "
+                "mediante Codex. Indica el servicio y el cambio; el PR se crea cuando lo solicitas. "
+                "Después registro el proceso en un worktree separado del brain."
+                if self.worker is not None
+                else "Puedo consultar la documentación del brain, pero el worker de cambios no está configurado."
+            )
+            self._enqueue_direct(request.request_id, text, remember=False)
 
     async def record_processing_failure(
         self,
@@ -733,6 +760,8 @@ class PooIAOrchestrator:
             repository = job.repository or str(job.payload.get("repository") or "")
             if not repository:
                 raise RuntimeError(REPOSITORY_REQUIRED_MESSAGE)
+            if is_documentation_repository(repository):
+                raise RuntimeError("El brain es documental y no puede recibir trabajos de ejecución. Indica el servicio.")
             prompt = str(job.payload.get("prompt", ""))
             try:
                 existing = await self.worker.get_job(job.job_id)
@@ -746,16 +775,13 @@ class PooIAOrchestrator:
                 )
 
             preflight = ""
+            target_files: tuple[str, ...] = ()
             if not bool(job.payload.get("skip_preflight")):
                 if self.opencode is None:
                     raise RuntimeError(OPENCODE_DISABLED_MESSAGE)
                 preflight = await self._run_checkpointed_research(
                     job,
-                    (
-                        "Prepara un preflight de solo lectura para este cambio. "
-                        "Identifica archivos, reglas y pruebas pertinentes; no edites nada.\n\n"
-                        + prompt
-                    ),
+                    build_preflight_request(prompt, repository),
                     instructions=self.instructions,
                     conversation_context=str(
                         job.payload.get("conversation_context", "")
@@ -763,6 +789,9 @@ class PooIAOrchestrator:
                     active_repository=repository,
                     checkpoint_key="preflight_session_id",
                 )
+                evidence = parse_preflight(preflight, repository)
+                target_files = evidence.files
+                preflight = evidence.to_context()
             manifest = await self.worker.create_codex_job(
                 job_id=job.job_id,
                 repository=repository,
@@ -770,6 +799,7 @@ class PooIAOrchestrator:
                 preflight=preflight,
                 policy=str(job.payload.get("policy", self.instructions)),
                 publish=bool(job.payload.get("publish")),
+                target_files=target_files,
             )
             return await self._wait_for_worker(
                 job.job_id,
@@ -784,6 +814,8 @@ class PooIAOrchestrator:
             target = self.storage.get_job(target_id)
             if target is None:
                 raise RuntimeError(JOB_NOT_FOUND_MESSAGE)
+            if is_documentation_repository(target.repository):
+                raise RuntimeError("El PR de ejecución no puede publicarse en el brain documental.")
             notification_was_completed = target.notification_completed_at is not None
             manifest = await self.worker.publish_job(
                 target_id, override=bool(job.payload.get("override"))
@@ -943,6 +975,7 @@ class PooIAOrchestrator:
             "diff",
             "pr_url",
             "result_path",
+            "documentation",
         )
         checkpoint = {
             key: manifest[key]
@@ -1077,6 +1110,7 @@ class PooIAOrchestrator:
             details.append(job.summary)
         if job.safe_error:
             details.append(f"Error: {job.safe_error}")
+        details.extend(self._documentation_details(job))
         return " ".join(details) + refresh_warning
 
     async def _cancel_text(self, job: Job | None) -> str:
@@ -1107,7 +1141,8 @@ class PooIAOrchestrator:
             text = job.summary or "La investigación terminó sin contenido."
             backend = Backend.OPENCODE
             remember = True
-            inferred_repository = self._repository_from_research(text)
+            explicit_repository = self._mentioned_repository(str(job.payload.get("question", "")))
+            inferred_repository = explicit_repository or self._repository_from_research(text)
             if inferred_repository is not None:
                 self.storage.set_conversation_context_for_request(
                     job.request_id, active_repository=inferred_repository
@@ -1123,9 +1158,17 @@ class PooIAOrchestrator:
         else:
             detail = f" Detalle: {job.safe_error}" if job.safe_error else ""
             text = f"El trabajo {job.job_id[:8]} falló.{detail}"
+            if job.repository:
+                text += f"\nRepositorio de ejecución: {job.repository}."
+            if job.summary:
+                text += "\n" + job.summary[:2500]
             backend = Backend.WORKER if job.kind is not JobKind.RESEARCH else Backend.OPENCODE
             remember = False
             self.storage.update_request_status(job.request_id, RequestStatus.FAILED)
+        if job.state in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            details = self._documentation_details(job)
+            if details:
+                text += "\n" + "\n".join(details)
         self.outbox.enqueue(
             job.request_id,
             text,
@@ -1147,9 +1190,24 @@ class PooIAOrchestrator:
             parts.append(job.summary)
         if job.external_reference:
             parts.append(f"PR: {job.external_reference}")
+        parts.extend(PooIAOrchestrator._documentation_details(job))
         if job.state is JobStatus.PREPARED:
             parts.append("El cambio quedó aislado y listo para revisión o publicación.")
         return "\n".join(parts)
+
+    @staticmethod
+    def _documentation_details(job: Job) -> list[str]:
+        parts: list[str] = []
+        documentation = job.checkpoint.get("documentation")
+        if isinstance(documentation, Mapping):
+            if documentation.get("state") == "prepared":
+                parts.append(
+                    f"Bitácora del brain preparada por separado: {documentation.get('path')}. "
+                    f"Rama: {documentation.get('branch')}. Pendiente de integrar al brain."
+                )
+            elif documentation.get("state") == "failed":
+                parts.append(f"Documentación pendiente: {documentation.get('error')}.")
+        return parts
 
     def _resolve_job(self, reference: str | None) -> Job | None:
         if not reference:
@@ -1208,12 +1266,7 @@ class PooIAOrchestrator:
         return " ".join(parts)
 
     def _mentioned_repository(self, text: str) -> str | None:
-        normalized_text = f" {_normalized_words(text)} "
-        matches = [
-            repository
-            for repository in self.repositories
-            if f" {_normalized_words(repository)} " in normalized_text
-        ]
+        matches = mentioned_execution_repositories(text, self.repositories)
         return matches[0] if len(matches) == 1 else None
 
     def _repository_from_research(self, summary: str) -> str | None:
@@ -1232,9 +1285,9 @@ class PooIAOrchestrator:
         service_repositories = [
             repository
             for repository in mentioned
-            if _normalized_words(repository) != "brain capnet"
+            if not is_documentation_repository(repository)
         ]
-        candidates = service_repositories if service_repositories else mentioned
+        candidates = service_repositories
         return candidates[0] if len(candidates) == 1 else None
 
     @staticmethod

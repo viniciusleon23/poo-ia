@@ -12,11 +12,17 @@ import unicodedata
 from collections.abc import Iterable
 
 from .models import Backend, Intent, RouteDecision
+from .repository_scope import (
+    AMBIGUOUS_REPOSITORY,
+    DOCUMENTATION_REPOSITORY_READ_ONLY,
+    REPOSITORY_REQUIRED,
+    UNKNOWN_REPOSITORY,
+    is_documentation_repository,
+    resolve_execution_repository,
+)
 
 
 AWS_DISABLED = "AWS_DISABLED"
-REPOSITORY_REQUIRED = "REPOSITORY_REQUIRED"
-AMBIGUOUS_REPOSITORY = "AMBIGUOUS_REPOSITORY"
 
 
 SMALL_TALK = frozenset(
@@ -39,6 +45,9 @@ SMALL_TALK = frozenset(
 )
 
 FORGET_PHRASES = frozenset({"olvida la conversacion"})
+CAPABILITY_PHRASES = frozenset(
+    {"ya puedes editar", "puedes editar", "que puedes hacer", "puedes hacer cambios"}
+)
 STATUS_PHRASES = frozenset(
     {
         "como va",
@@ -74,16 +83,19 @@ _STATUS_PATTERN = re.compile(
 )
 _CODE_CHANGE_PATTERN = re.compile(
     r"^(?:por favor )?(?:(?:hecho|ok|okay|vale|perfecto|si)\s+)*(?:"
-    r"agrega|anade|cambia|modifica|elimina|borra|implementa|"
+    r"agrega|anade|cambia|modifica|edita|editar|edit|elimina|borra|implementa|"
     r"corrige|arregla|crea|actualiza|renombra|reemplaza|aplica|haz el cambio|"
-    r"hazlo|agregalo|anadelo|cambialo|modificalo|eliminalo|borralo|"
+    r"hazlo|agregalo|anadelo|cambialo|modificalo|editalo|eliminalo|borralo|"
     r"implementalo|corrigelo|arreglalo|actualizalo|renombralo|reemplazalo|"
     r"aplicalo)\b|"
     r"\b(?:quiero|necesito|puedes|podrias|debes|hay que|vamos a|te pido)\s+"
-    r"(?:que\s+)?(?:agregar|anadir|cambiar|modificar|eliminar|borrar|"
+    r"(?:que\s+)?(?:agregar|anadir|cambiar|modificar|editar|eliminar|borrar|"
     r"implementar|corregir|arreglar|crear|actualizar|renombrar|reemplazar|"
-    r"aplicar|agregues|anadas|cambies|modifiques|elimines|implementes|"
-    r"corrijas|arregles|crees|actualices|renombres|reemplaces|apliques)\b"
+    r"aplicar|agregues|anadas|cambies|modifiques|edites|elimines|implementes|"
+    r"corrijas|arregles|crees|actualices|renombres|reemplaces|apliques)\b|"
+    r"^(?:por favor )?(?:lee|consulta|revisa|busca)\b.*\b(?:y|luego)\s+"
+    r"(?:agrega|anade|cambia|modifica|edita|elimina|"
+    r"implementa|corrige|arregla|actualiza|aplica)\b"
 )
 _FOLLOW_UP_CHANGE = frozenset(
     {
@@ -98,6 +110,7 @@ _FOLLOW_UP_CHANGE = frozenset(
         "corrigelo",
         "dale",
         "eliminalo",
+        "editalo",
         "hazlo",
         "implementalo",
         "modificalo",
@@ -106,12 +119,6 @@ _FOLLOW_UP_CHANGE = frozenset(
         "renombralo",
         "reemplazalo",
     }
-)
-_DEICTIC_REPOSITORY_PATTERN = re.compile(
-    r"\b(?:ese|este|aquel|el|mismo)\s+(?:repo|repositorio)\b"
-)
-_EXPLICIT_REPOSITORY_PATTERN = re.compile(
-    r"\b(?:repo|repositorio)\s+[`'\"]?([a-z0-9][a-z0-9._-]{1,100})"
 )
 _UUID_PATTERN = re.compile(
     r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
@@ -150,66 +157,13 @@ def _extract_job_id(message: str, active_job_id: str | None) -> str | None:
     return active_job_id
 
 
-def _repository_matches(message: str, repositories: Iterable[str]) -> tuple[str, ...]:
-    normalized_message = f" {_phrase_normalize(message)} "
-    matches: list[str] = []
-    seen: set[str] = set()
-    for repository in repositories:
-        repository = str(repository).strip()
-        if not repository or repository.casefold() in seen:
-            continue
-        normalized_repository = _phrase_normalize(repository)
-        if normalized_repository and f" {normalized_repository} " in normalized_message:
-            matches.append(repository)
-            seen.add(repository.casefold())
-
-    if len(matches) <= 1:
-        return tuple(matches)
-
-    # Prefer a uniquely longest full name over a shorter alias contained in it.
-    longest_size = max(len(_phrase_normalize(candidate)) for candidate in matches)
-    longest = [
-        candidate
-        for candidate in matches
-        if len(_phrase_normalize(candidate)) == longest_size
-    ]
-    return tuple(longest) if len(longest) == 1 else tuple(matches)
-
-
-def _resolve_repository(
-    message: str,
-    *,
-    active_repository: str | None,
-    repositories: Iterable[str],
-) -> tuple[str | None, str | None]:
-    matches = _repository_matches(message, repositories)
-    if len(matches) > 1:
-        return None, AMBIGUOUS_REPOSITORY
-    if matches:
-        return matches[0], None
-
-    normalized = _normalize(message)
-    explicit = _EXPLICIT_REPOSITORY_PATTERN.search(normalized)
-    if explicit and explicit.group(1) not in {"ese", "este", "aquel", "el", "mismo"}:
-        return explicit.group(1), None
-
-    if active_repository and (
-        _DEICTIC_REPOSITORY_PATTERN.search(_phrase_normalize(message))
-        or _phrase_normalize(message) in _FOLLOW_UP_CHANGE
-    ):
-        return active_repository, None
-
-    # Keep the established repository until an explicit reference replaces it.
-    if active_repository:
-        return active_repository, None
-    return None, REPOSITORY_REQUIRED
-
-
 def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
     """Classify explicit controls/mutations and default technical text to research."""
     normalized = _phrase_normalize(message)
     if normalized in FORGET_PHRASES:
         return Intent.FORGET
+    if normalized in CAPABILITY_PHRASES:
+        return Intent.CAPABILITIES
     if normalized in STATUS_PHRASES or _STATUS_PATTERN.search(normalized):
         return Intent.JOB_STATUS
     if _CANCEL_PATTERN.search(normalized):
@@ -242,16 +196,19 @@ def route_message(
     """Return a transport-neutral deterministic route for one owner message."""
     intent = classify_intent(
         message,
-        has_active_change=active_repository is not None or active_job_id is not None,
+        has_active_change=(
+            active_repository is not None and not is_documentation_repository(active_repository)
+        ) or active_job_id is not None,
     )
 
     if intent is Intent.CHAT:
         return RouteDecision(intent, Backend.OLLAMA)
     if intent is Intent.RESEARCH:
-        return RouteDecision(intent, Backend.OPENCODE, repository=active_repository)
+        repository, _ = resolve_execution_repository(message, active_repository, repositories)
+        return RouteDecision(intent, Backend.OPENCODE, repository=repository)
     if intent is Intent.AWS_REPORT:
         return RouteDecision(intent, Backend.NONE, reason=AWS_DISABLED)
-    if intent is Intent.FORGET:
+    if intent in {Intent.FORGET, Intent.CAPABILITIES}:
         return RouteDecision(intent, Backend.STORAGE)
     if intent in {Intent.JOB_STATUS, Intent.CANCEL}:
         return RouteDecision(
@@ -261,14 +218,15 @@ def route_message(
         )
 
     job_id = _extract_job_id(message, active_job_id)
-    if intent is Intent.PULL_REQUEST and job_id is not None:
-        return RouteDecision(intent, Backend.WORKER, job_id=job_id)
-
-    repository, repository_error = _resolve_repository(
+    repository, repository_error = resolve_execution_repository(
         message,
         active_repository=active_repository,
         repositories=repositories,
     )
+    if intent is Intent.PULL_REQUEST and job_id is not None and repository_error in {
+        None, REPOSITORY_REQUIRED
+    }:
+        return RouteDecision(intent, Backend.WORKER, repository=repository, job_id=job_id)
     if repository_error is not None:
         return RouteDecision(
             Intent.CLARIFY,

@@ -89,7 +89,7 @@ async def health(request: web.Request) -> web.Response:
 
 async def create_codex_job(request: web.Request) -> web.Response:
     payload = await _json_object(request)
-    allowed = {"job_id", "repository", "prompt", "preflight", "policy", "publish"}
+    allowed = {"job_id", "repository", "prompt", "preflight", "policy", "publish", "target_files"}
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"unknown fields: {', '.join(unknown)}")
@@ -103,6 +103,9 @@ async def create_codex_job(request: web.Request) -> web.Response:
     publish = payload.get("publish", False)
     if not isinstance(publish, bool):
         raise ValueError("publish must be true or false")
+    target_files = payload.get("target_files", [])
+    if not isinstance(target_files, list):
+        raise ValueError("target_files must be a list")
     job = JobRequest(
         job_id=payload["job_id"],
         repository=payload["repository"],
@@ -110,6 +113,7 @@ async def create_codex_job(request: web.Request) -> web.Response:
         preflight=payload.get("preflight", ""),
         policy=payload.get("policy", ""),
         publish=publish,
+        target_files=tuple(target_files),
     )
     manifest, created = await request.app[MANAGER_KEY].create(job)
     return web.json_response(

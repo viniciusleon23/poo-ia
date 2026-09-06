@@ -7,6 +7,8 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+from app.repository_scope import is_documentation_repository
+
 from .config import WorkerSettings
 from .models import DiffMeasurement, JobState
 from .processes import (
@@ -111,11 +113,16 @@ class CodexRunner:
                 expected=(JobState.QUEUED, JobState.RUNNING),
                 transform=claim,
             )
+            if is_documentation_repository(manifest.repository):
+                raise ValueError("El brain es documental; los cambios requieren un repositorio de ejecución.")
             snapshot = self.repositories.resolve(manifest.repository)
+            if is_documentation_repository(snapshot.name):
+                raise ValueError("El brain es documental; su alias tampoco admite ejecución.")
             prepared = self.repositories.prepare(
                 snapshot, manifest.job_id, manifest.prompt
             )
             snapshot = prepared.repository
+            self._validate_target_files(prepared.path, manifest.target_files)
             if manifest.base_commit and manifest.base_commit != snapshot.base_commit:
                 raise RuntimeError(
                     "the existing worktree no longer matches the job base commit"
@@ -193,16 +200,11 @@ class CodexRunner:
             if result.stderr:
                 _append_private(events_path, "\n[stderr]\n" + result.stderr)
             if result.returncode != 0:
-                self.store.update(
+                self._fail(
                     job_id,
-                    expected=(JobState.RUNNING,),
-                    transform=lambda current: current.evolve(
-                        state=JobState.FAILED,
-                        process_pid=None,
-                        codex_exit_code=result.returncode,
-                        error="Codex did not complete the requested change.",
-                        result_path=str(events_path),
-                    ),
+                    "Codex did not complete the requested change.",
+                    codex_exit_code=result.returncode,
+                    result_path=events_path,
                 )
                 return
 
@@ -238,6 +240,11 @@ class CodexRunner:
                 if has_changes
                 else "Codex completed but produced no repository changes; the requested change was not confirmed."
             )
+            from .documentation import record_process
+            documentation = record_process(self.settings, manifest.evolve(
+                state=next_state, validation=validation, diff=measurement,
+                summary=summary, error=completion_error,
+            ))
             self.store.update(
                 job_id,
                 expected=(JobState.RUNNING,),
@@ -255,6 +262,7 @@ class CodexRunner:
                     summary=summary,
                     error=completion_error,
                     result_path=str(patch_path),
+                    documentation=documentation,
                 ),
             )
         except ManifestStateError:
@@ -262,6 +270,28 @@ class CodexRunner:
             return
         except Exception as error:
             self._fail(job_id, _safe_error(error))
+
+    @staticmethod
+    def _validate_target_files(worktree: Path, files: tuple[str, ...]) -> None:
+        """Check evidence against the actual execution root before invoking Codex."""
+        from pathlib import PurePosixPath
+        root = worktree.resolve()
+        for name in files:
+            path = PurePosixPath(name)
+            if (
+                not name or path.is_absolute() or "\\" in name or "\x00" in name
+                or any(part in {"..", ".git", ".ssh", ".aws"} for part in path.parts)
+                or any(part.startswith(".env") for part in path.parts)
+            ):
+                raise ValueError("La ruta del preflight no pertenece al repositorio de ejecución.")
+            candidate = root.joinpath(*path.parts)
+            if not candidate.resolve().is_relative_to(root) or candidate.is_dir():
+                raise ValueError("La ruta del preflight sale del repositorio de ejecución o no es un archivo.")
+            current = root
+            for part in path.parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError("La ruta del preflight contiene un enlace simbólico; ejecución detenida.")
 
     def _capture_diff(
         self,
@@ -335,8 +365,17 @@ class CodexRunner:
         diff: DiffMeasurement | None = None,
         diff_sha256: str | None = None,
         result_path: Path | None = None,
+        codex_exit_code: int | None = None,
     ) -> None:
         try:
+            from .documentation import record_process
+            current = self.store.get(job_id)
+            if current.state not in {JobState.QUEUED, JobState.RUNNING}:
+                return
+            documentation = record_process(self.settings, current.evolve(
+                state=JobState.FAILED, error=error,
+                diff=diff if diff is not None else current.diff,
+            ))
             self.store.update(
                 job_id,
                 expected=(JobState.QUEUED, JobState.RUNNING),
@@ -344,6 +383,8 @@ class CodexRunner:
                     state=JobState.FAILED,
                     process_pid=None,
                     error=error,
+                    codex_exit_code=codex_exit_code,
+                    documentation=documentation,
                     diff=diff if diff is not None else current.diff,
                     diff_sha256=(
                         diff_sha256 if diff_sha256 is not None else current.diff_sha256

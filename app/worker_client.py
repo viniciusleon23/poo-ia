@@ -81,6 +81,7 @@ class WorkerClient:
         preflight: str | None = None,
         policy: str | None = None,
         publish: bool = False,
+        target_files: tuple[str, ...] = (),
     ) -> dict[str, object]:
         """Create or recover one idempotent Codex job."""
         payload: dict[str, object] = {
@@ -93,6 +94,8 @@ class WorkerClient:
             payload["preflight"] = preflight
         if policy:
             payload["policy"] = policy
+        if target_files:
+            payload["target_files"] = list(target_files)
         return await self._job_request("POST", "/v1/jobs/codex", payload)
 
     async def get_job(self, job_id: str) -> dict[str, object]:

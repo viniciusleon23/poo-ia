@@ -48,7 +48,19 @@ docs/         Diseño, plan y manual operativo
 tests/        Pruebas sin depender de Discord, Ollama, Codex o GitHub reales
 ```
 
-Los repositorios que puede modificar el worker no viven dentro de Poo-IA. Son hijos directos de `/home/poo/capnet-workspace`; `brain-capnet` es uno de ellos. Los cambios se crean fuera de sus checkouts base, bajo `/home/poo/capnet-worktrees`. OpenCode no recibe esos checkouts: antes de arrancar se genera `/home/poo/capnet-research-view` únicamente con archivos de texto permitidos de cada `HEAD` confirmado en Git, sin metadatos `.git`, archivos no rastreados ni material detectado como secreto.
+Los repositorios de ejecución no viven dentro de Poo-IA: son hijos directos de `/home/poo/capnet-workspace`, excluyendo `brain-capnet`, que se reserva para conocimiento y bitácoras. Los cambios se crean fuera de sus checkouts base, bajo `/home/poo/capnet-worktrees`. OpenCode no recibe esos checkouts: antes de arrancar se genera `/home/poo/capnet-research-view` únicamente con archivos de texto permitidos de cada `HEAD` confirmado en Git, sin metadatos `.git`, archivos no rastreados ni material detectado como secreto.
+
+### Brain, ejecución y regreso documental
+
+`brain-capnet` contiene conocimiento de referencia y queda excluido de los destinos de cambios de código y PR de servicios. Citar sus archivos no establece un repositorio de ejecución. Los nombres de servicios explícitos prevalecen sobre la memoria; `task`, `tasks`, `tarea` y `tareas` se resuelven a `capnet-next-lambda-tasks` cuando está disponible. El worker repite esta comprobación para rechazar solicitudes directas o históricas que apunten al brain.
+
+El flujo es **consulta del brain → repositorio de ejecución → cambio y PR solicitado → bitácora separada del brain**. El preflight devuelve JSON con `repository`, `status`, `files`, `notes` y `missing_information`. Un resultado incompleto o con repositorio diferente detiene la ejecución antes de Codex. Los archivos candidatos se verifican dentro del worktree real, incluyendo enlaces simbólicos. Las preguntas de capacidades las responde el núcleo; `edita/editar` se reconoce como cambio cuando expresa una orden concreta.
+
+Al preparar el resultado y al publicar su PR, el worker escribe `Procesos/Poo-IA/<job_id>.md` en un worktree del brain llamado `brain-docs-<job_id>`, rama `poo-ia/docs-<job_id>`. La bitácora contiene estado, repositorio, rama, commit base, medición, validación y URL del PR. No contiene prompts, políticas, código ni salidas completas del modelo. Una repetición actualiza el mismo documento y el diff del servicio nunca incluye la bitácora.
+
+La bitácora queda **preparada y pendiente de integrar al brain**: no se hace commit, push ni PR documental automáticamente. Hasta que se integre en el `HEAD` del brain y se reconstruya la vista documental, OpenCode no verá ese registro. Solo `Procesos/Poo-IA/*.md` se incorpora a las rutas documentales permitidas; el resto de `Procesos` permanece fuera. La respuesta del bot distingue la ejecución del estado documental, y un fallo al documentar no convierte un cambio preparado o un PR publicado en fallo de ejecución.
+
+La migración 003 elimina el antiguo contexto que apuntaba al brain conservando los trabajos históricos. El registro histórico que aparece como exitoso con cero cambios no se reclasifica ni se publica automáticamente.
 
 ## Comportamiento en Discord
 

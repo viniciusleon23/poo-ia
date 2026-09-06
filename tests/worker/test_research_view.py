@@ -66,6 +66,9 @@ class ResearchViewTests(unittest.TestCase):
         (brain / "Solicitudes" / "restringida.md").write_text(
             "solo con autorización", encoding="utf-8"
         )
+        (brain / "Procesos" / "Poo-IA").mkdir(parents=True)
+        (brain / "Procesos" / "Poo-IA" / "job-123.md").write_text("registro integrado", encoding="utf-8")
+        (brain / "Procesos" / "privado.md").write_text("fuera de la ruta autorizada", encoding="utf-8")
         self._commit(brain)
         (brain / "untracked.md").write_text("do not export", encoding="utf-8")
 
@@ -144,6 +147,8 @@ class ResearchViewTests(unittest.TestCase):
             (self.target / "brain-capnet/Solicitudes/restringida.md").exists()
         )
         self.assertFalse((self.target / "brain-capnet/untracked.md").exists())
+        self.assertEqual((self.target / "brain-capnet/Procesos/Poo-IA/job-123.md").read_text(), "registro integrado")
+        self.assertFalse((self.target / "brain-capnet/Procesos/privado.md").exists())
         self.assertFalse(any(path.name == ".git" for path in self.target.rglob("*")))
 
     def test_rejects_overlapping_roots_and_missing_brain(self) -> None:

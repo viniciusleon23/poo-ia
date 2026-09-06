@@ -16,6 +16,7 @@ class Intent(str, Enum):
     """User intentions understood by the deterministic router."""
 
     CHAT = "chat"
+    CAPABILITIES = "capabilities"
     RESEARCH = "research"
     AWS_REPORT = "aws_report"
     CODE_CHANGE = "code_change"

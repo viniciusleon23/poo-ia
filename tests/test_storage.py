@@ -49,13 +49,13 @@ class StorageMigrationTests(unittest.TestCase):
             registration = first.register_inbound(
                 message(1), intent=Intent.RESEARCH, backend=Backend.OPENCODE
             )
-            self.assertEqual(first.schema_version, 2)
+            self.assertEqual(first.schema_version, 3)
             self.assertEqual(first.journal_mode, "wal")
             self.assertTrue(first.foreign_keys_enabled)
             first.close()
 
             second = SQLiteStorage(path)
-            self.assertEqual(second.schema_version, 2)
+            self.assertEqual(second.schema_version, 3)
             self.assertEqual(
                 second.get_inbound(registration.request.request_id), registration.request
             )
@@ -67,6 +67,24 @@ class StorageMigrationTests(unittest.TestCase):
             directory_path.mkdir()
             with self.assertRaises(Exception):
                 SQLiteStorage(directory_path)
+
+    def test_execution_context_migration_clears_brain_and_preserves_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            storage = SQLiteStorage(path)
+            brain_key = ConversationKey("discord", 100, 200)
+            service_key = ConversationKey("discord", 101, 200)
+            storage.set_conversation_context(brain_key, active_repository="brain-capnet", last_job_id="old-brain")
+            storage.set_conversation_context(service_key, active_repository="capnet-next-lambda-tasks", last_job_id="service-job")
+            storage.close()
+            with sqlite3.connect(path) as connection:
+                connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+            upgraded = SQLiteStorage(path)
+            self.assertIsNone(upgraded.get_conversation(brain_key).active_repository)
+            self.assertIsNone(upgraded.get_conversation(brain_key).last_job_id)
+            self.assertEqual(upgraded.get_conversation(service_key).active_repository, "capnet-next-lambda-tasks")
+            self.assertEqual(upgraded.get_conversation(service_key).last_job_id, "service-job")
+            upgraded.close()
 
     def test_existing_version_one_database_receives_notification_ack_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -133,7 +151,7 @@ class StorageMigrationTests(unittest.TestCase):
             connection.close()
 
             storage = SQLiteStorage(path)
-            self.assertEqual(storage.schema_version, 2)
+            self.assertEqual(storage.schema_version, 3)
             self.assertEqual(
                 storage.get_job("job-v1").notification_completed_at, 3
             )

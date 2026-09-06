@@ -215,6 +215,8 @@ def _brain_path_is_searchable(path: PurePosixPath) -> bool:
         return True
     if first in {"Servicios", "Decisiones", "Ideas", "Changelog"}:
         return path.suffix.casefold() in {".md", ".mdx"}
+    if path.parts[:2] == ("Procesos", "Poo-IA") and len(path.parts) == 3:
+        return path.suffix.casefold() == ".md"
     return path in {
         PurePosixPath("Arquitectura/Mapa-de-servicios.md"),
         PurePosixPath("Arquitectura/dependencias.json"),

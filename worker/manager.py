@@ -106,7 +106,8 @@ class JobManager:
         return manifest
 
     async def repository_names(self) -> tuple[str, ...]:
-        return await asyncio.to_thread(self.repositories.clean_names)
+        from app.repository_scope import execution_repositories
+        return execution_repositories(await asyncio.to_thread(self.repositories.clean_names))
 
     async def cancel(self, job_id: str) -> JobManifest:
         current = self.store.get(job_id)
@@ -186,6 +187,9 @@ class JobManager:
         """Durably queue publication and return without waiting for Git or GitHub."""
         async with self._publish_lock:
             current = self.store.get(job_id)
+            from app.repository_scope import is_documentation_repository
+            if is_documentation_repository(current.repository):
+                raise ManifestStateError("El brain es documental y no recibe PR de ejecución.")
             if current.pr_url or current.state is JobState.SUCCEEDED:
                 return current, False
             if current.state is JobState.PUBLISHING:

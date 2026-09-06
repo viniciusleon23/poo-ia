@@ -421,6 +421,11 @@ class GitHubPublisher:
 
     @staticmethod
     def _require_common_metadata(manifest: JobManifest) -> None:
+        from app.repository_scope import is_documentation_repository
+        if is_documentation_repository(manifest.repository) or (
+            manifest.repo_path and is_documentation_repository(Path(manifest.repo_path).name)
+        ):
+            raise PublicationError("El brain es documental y no puede recibir el PR de ejecución.")
         if not manifest.worktree or not manifest.branch or not manifest.base_commit:
             raise PublicationError("prepared job is missing Git worktree metadata")
 
@@ -455,6 +460,10 @@ class GitHubPublisher:
         return self._extract_url(result.stdout)
 
     def _succeed(self, job_id: str, url: str) -> JobManifest:
+        from .documentation import record_process
+        documentation = record_process(self.settings, self.store.get(job_id).evolve(
+            state=JobState.SUCCEEDED, pr_url=url, error=None,
+        ))
         return self.store.update(
             job_id,
             expected=(JobState.PUBLISHING,),
@@ -463,6 +472,7 @@ class GitHubPublisher:
                 process_pid=None,
                 pr_url=url,
                 error=None,
+                documentation=documentation,
             ),
         )
 

@@ -6,7 +6,9 @@ from app.models import Backend, Intent
 from app.router import (
     AMBIGUOUS_REPOSITORY,
     AWS_DISABLED,
+    DOCUMENTATION_REPOSITORY_READ_ONLY,
     REPOSITORY_REQUIRED,
+    UNKNOWN_REPOSITORY,
     choose_backend,
     classify_intent,
     route_message,
@@ -70,6 +72,7 @@ class RouterTests(unittest.TestCase):
             "¿Cómo va a funcionar el nuevo servicio?",
             "necesito saber cómo crear un PR",
             "puedes explicarme cómo abrir un pull request",
+            "¿Qué hace el proceso que lee brain-capnet y agrega el resultado?",
         )
 
         for message in messages:
@@ -154,3 +157,77 @@ class RouterTests(unittest.TestCase):
 
         self.assertEqual(decision.intent, Intent.RESEARCH)
         self.assertEqual(decision.backend, Backend.OPENCODE)
+
+    def test_brain_context_cannot_be_reused_for_changes(self) -> None:
+        for message in ("agrega el campo task_available", "hazlo"):
+            with self.subTest(message=message):
+                decision = route_message(message, active_repository="brain-capnet")
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertIsNone(decision.repository)
+                self.assertEqual(decision.reason, REPOSITORY_REQUIRED)
+
+    def test_edits_target_execution_repo_after_brain_research(self) -> None:
+        repositories = ("brain-capnet", "capnet-next-lambda-tasks")
+        for message in (
+            "agrega task_available como booleano en task",
+            "edita schemas/base_response.py en tasks",
+            "editar el esquema en tareas",
+            "lee brain-capnet y agrega el campo en tasks",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message, active_repository="brain-capnet", repositories=repositories
+                )
+                self.assertEqual(decision.intent, Intent.CODE_CHANGE)
+                self.assertEqual(decision.repository, "capnet-next-lambda-tasks")
+
+    def test_brain_explicit_change_or_pr_is_rejected_even_with_active_job(self) -> None:
+        for message in (
+            "edita el repo brain-capnet",
+            "agrega el campo en capnet-brain",
+            "crea el PR en el repo brain-capnet",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message,
+                    active_repository="customer-service",
+                    active_job_id="prepared-123",
+                    repositories=("brain-capnet", "customer-service"),
+                )
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertEqual(decision.reason, DOCUMENTATION_REPOSITORY_READ_ONLY)
+
+    def test_new_research_repository_overrides_execution_memory(self) -> None:
+        decision = route_message(
+            "busca el modelo en tasks",
+            active_repository="customer-service",
+            repositories=("customer-service", "capnet-next-lambda-tasks"),
+        )
+        self.assertEqual(decision.intent, Intent.RESEARCH)
+        self.assertEqual(decision.repository, "capnet-next-lambda-tasks")
+        brain_only = route_message("lee brain-capnet", active_repository="brain-capnet")
+        self.assertIsNone(brain_only.repository)
+
+    def test_unknown_explicit_repo_does_not_reuse_active_job_or_repository(self) -> None:
+        for message in ("agrega campo en repo typo-service", "abre PR en repo typo-service"):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message,
+                    active_repository="customer-service",
+                    active_job_id="prepared-123",
+                    repositories=("customer-service",),
+                )
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertEqual(decision.reason, UNKNOWN_REPOSITORY)
+
+    def test_capability_questions_do_not_start_research_or_mutation(self) -> None:
+        for message in (
+            "¿Ya puedes editar?",
+            "¿Puedes editar?",
+            "¿Qué puedes hacer?",
+            "¿Puedes hacer cambios?",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(message, active_repository="brain-capnet")
+                self.assertEqual(decision.intent, Intent.CAPABILITIES)
+                self.assertEqual(decision.backend, Backend.STORAGE)

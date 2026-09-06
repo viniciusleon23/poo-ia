@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,6 +44,7 @@ class FakeOpenCode:
     def __init__(self, response: str = "resultado documental con ruta/file.py") -> None:
         self.response = response
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.preflight_response: str | None = None
         self.active_session_id: str | None = None
         self.maximum_active = 0
         self._active = 0
@@ -73,6 +75,14 @@ class FakeOpenCode:
                 await self.release.wait()
             if self.research_error_after_session is not None:
                 raise self.research_error_after_session
+            if prompt.startswith("Prepara un preflight"):
+                return self.preflight_response or json.dumps({
+                    "repository": kwargs.get("active_repository"),
+                    "status": "ready",
+                    "files": ["schemas/base_response.py"],
+                    "notes": "Archivo de tareas verificado.",
+                    "missing_information": [],
+                })
             return self.response
         finally:
             self._active -= 1
@@ -529,6 +539,78 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             self.worker.create_calls[-1]["repository"],
             "capnet-next-lambda-tasks",
         )
+
+    async def test_brain_research_never_becomes_execution_context(self) -> None:
+        self.opencode.response = "La guía está en brain-capnet/ai/rutas-de-consulta.md"
+        await self.orchestrator.handle(InboundMessage(120, 100, 200, "investiga la guía documental"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertIsNone(self.storage.get_conversation(KEY).active_repository)
+        submission = await self.orchestrator.handle(InboundMessage(
+            121, 100, 200,
+            "Hola necesito agregar este campo task_available de tipo boleando en task, y que todo sea por defecto como true",
+        ))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.storage.get_job(submission.job_id).state, JobStatus.PREPARED)
+        self.assertEqual(self.worker.create_calls[-1]["repository"], "capnet-next-lambda-tasks")
+
+    async def test_preflight_repository_mismatch_never_reaches_worker(self) -> None:
+        self.opencode.preflight_response = json.dumps({
+            "repository": "brain-capnet", "status": "ready", "files": ["README.md"],
+            "notes": "La evidencia contradice el destino", "missing_information": [],
+        })
+        submission = await self.orchestrator.handle(InboundMessage(
+            122, 100, 200, "agrega un campo en capnet-next-lambda-tasks",
+        ))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.worker.create_calls, [])
+        self.assertEqual(self.storage.get_job(submission.job_id).state, JobStatus.FAILED)
+
+    async def test_dependency_citation_cannot_replace_explicit_execution_target(self) -> None:
+        self.opencode.response = "Depende del código customer-service/models.py."
+        await self.orchestrator.handle(InboundMessage(127, 100, 200, "investiga tasks"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.storage.get_conversation(KEY).active_repository, "capnet-next-lambda-tasks")
+        await self.orchestrator.handle(InboundMessage(128, 100, 200, "agrega el campo example sin investigar"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.worker.create_calls[-1]["repository"], "capnet-next-lambda-tasks")
+
+    async def test_capabilities_are_answered_by_core_without_read_only_research(self) -> None:
+        submission = await self.orchestrator.handle(InboundMessage(123, 100, 200, "Ya puedes editar?"))
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.opencode.calls, [])
+        sent = " ".join(await self.flush_all())
+        self.assertIn("repositorio de ejecución", sent)
+        self.assertIn("brain", sent)
+
+    async def test_failed_job_notification_includes_actual_codex_explanation(self) -> None:
+        registration = self.storage.register_inbound(
+            InboundMessage(124, 100, 200, "agrega campo"), job_kind=JobKind.CODEX,
+            repository="capnet-next-lambda-tasks", payload={},
+        )
+        self.storage.transition_job(registration.job.job_id, JobStatus.RUNNING)
+        failed = self.storage.transition_job(
+            registration.job.job_id, JobStatus.FAILED,
+            summary="Falta el archivo schemas/base_response.py en este worktree.",
+            safe_error="Codex completed but produced no repository changes",
+        )
+        await self.orchestrator._on_job_finished(failed)
+        sent = " ".join(await self.flush_all())
+        self.assertIn("Falta el archivo", sent)
+        self.assertIn("capnet-next-lambda-tasks", sent)
+
+    async def test_pr_for_other_explicit_repository_never_publishes_active_job(self) -> None:
+        registration = self.storage.register_inbound(
+            InboundMessage(125, 100, 200, "agrega campo"), job_kind=JobKind.CODEX,
+            repository="capnet-next-lambda-tasks", payload={},
+        )
+        self.storage.transition_job(registration.job.job_id, JobStatus.RUNNING)
+        self.storage.transition_job(registration.job.job_id, JobStatus.PREPARED)
+        submission = await self.orchestrator.handle(InboundMessage(
+            126, 100, 200, f"arma el PR del trabajo {registration.job.job_id} en customer-service",
+        ))
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.worker.publish_calls, [])
+        self.assertIn("otro repositorio", " ".join(await self.flush_all()))
 
     async def test_combined_change_and_pr_after_research_starts_new_codex_job(self) -> None:
         self.opencode.response = (

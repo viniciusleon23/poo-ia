@@ -157,13 +157,14 @@ chmod 700 /home/poo/.config/poo-ia
 
 El archivo `/home/poo/.config/poo-ia/opencode-server.env` debe contener `OPENCODE_SERVER_PASSWORD=` seguido por una contraseña aleatoria larga y debe tener permisos `600`. Copia el mismo valor en el `.env` privado de Poo-IA. Nunca lo añadas a Git.
 
-Para instalar la unidad incluida se requieren permisos administrativos:
+La unidad incluida se instala como servicio del usuario `poo`, sin permisos administrativos:
 
 ```bash
-sudo cp /home/poo/poo-ia/ops/opencode-capnet.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now opencode-capnet
-sudo systemctl status opencode-capnet
+mkdir -p /home/poo/.config/systemd/user
+cp /home/poo/poo-ia/ops/opencode-capnet.service /home/poo/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now opencode-capnet
+systemctl --user status opencode-capnet
 ```
 
 Comprueba que solo escucha localmente y que exige autenticación antes de cambiar `OPENCODE_ENABLED=true`. Luego reconstruye Poo-IA:
@@ -206,7 +207,7 @@ docker compose config
 - **`Configuration error`:** revisa que `.env` contenga `DISCORD_TOKEN` y un `DISCORD_CHANNEL_ID` numérico.
 - **No se puede obtener respuesta de Ollama:** ejecuta `ollama list`, prueba la solicitud `curl` anterior y consulta `docker compose logs -f discord-bot`.
 - **El cerebro documental no está habilitado:** confirma que OpenCode funciona localmente antes de cambiar `OPENCODE_ENABLED=true`.
-- **OpenCode devuelve un error:** revisa `systemctl status opencode-capnet`, su autenticación y la sesión de ChatGPT/Codex; no añadas una API key como solución rápida.
+- **OpenCode devuelve un error:** revisa `systemctl --user status opencode-capnet`, su autenticación y la sesión de ChatGPT/Codex; no añadas una API key como solución rápida.
 - **La consulta tarda demasiado:** el límite predeterminado es de cinco minutos y solo se procesa una investigación simultánea.
 - **El contenedor no inicia por nombre duplicado:** detén primero la instalación antigua desde `~/discord-bot` con `docker compose down`.
 

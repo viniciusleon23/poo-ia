@@ -5,8 +5,6 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=poo
-Group=poo
 WorkingDirectory=/home/poo/capnet-workspace
 Environment=HOME=/home/poo
 Environment=PATH=/home/poo/.opencode/bin:/usr/local/bin:/usr/bin:/bin
@@ -28,4 +26,4 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

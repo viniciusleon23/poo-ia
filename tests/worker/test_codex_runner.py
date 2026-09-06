@@ -27,9 +27,10 @@ def git(cwd: Path, *arguments: str) -> str:
 
 
 class FakeCodexRunner(CommandRunner):
-    def __init__(self, *, timeout: bool = False) -> None:
+    def __init__(self, *, timeout: bool = False, write_change: bool = True) -> None:
         self.delegate = SubprocessCommandRunner()
         self.timeout = timeout
+        self.write_change = write_change
         self.codex_calls: list[tuple[tuple[str, ...], str]] = []
 
     def run(
@@ -77,7 +78,10 @@ class FakeCodexRunner(CommandRunner):
         output_path.write_text(
             "Added the requested field and kept defaults.\n", encoding="utf-8"
         )
-        (cwd / "task.py").write_text("task_available: bool = True\n", encoding="utf-8")
+        if self.write_change:
+            (cwd / "task.py").write_text(
+                "task_available: bool = True\n", encoding="utf-8"
+            )
         return CommandResult(0, '{"type":"turn.completed"}\n', "")
 
 
@@ -141,7 +145,7 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertEqual(git(self.repository, "rev-parse", "HEAD"), self.base_commit)
         self.assertFalse((self.repository / "task.py").exists())
         argv, prompt = commands.codex_calls[0]
-        self.assertIn(("--sandbox", "workspace-write"), tuple(zip(argv, argv[1:])))
+        self.assertIn(("--sandbox", "danger-full-access"), tuple(zip(argv, argv[1:])))
         self.assertIn("--ephemeral", argv)
         self.assertIn("--json", argv)
         self.assertEqual(argv[-1], "-")
@@ -176,6 +180,24 @@ class CodexRunnerTests(unittest.TestCase):
         )
         events = self.settings.jobs_root / request.job_id / "codex-events.jsonl"
         self.assertIn("partial", events.read_text(encoding="utf-8"))
+
+    def test_zero_diff_fails_instead_of_reporting_a_false_success(self) -> None:
+        request = JobRequest("discord-792", "capnet-tasks", "Small change")
+        self.store.create_or_get(request)
+
+        CodexRunner(
+            self.settings,
+            self.store,
+            command_runner=FakeCodexRunner(write_change=False),
+        ).run(request.job_id)
+
+        manifest = self.store.get(request.job_id)
+        self.assertEqual(manifest.state, JobState.FAILED)
+        self.assertEqual(manifest.codex_exit_code, 0)
+        self.assertEqual(manifest.diff.changed_files, 0)
+        self.assertIsNone(manifest.process_pid)
+        self.assertIn("produced no repository changes", manifest.error)
+        self.assertIn("Added the requested field", manifest.summary)
 
     def test_auto_publish_handoff_keeps_the_detached_process_claim(self) -> None:
         request = JobRequest(

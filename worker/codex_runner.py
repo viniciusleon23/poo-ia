@@ -143,7 +143,7 @@ class CodexRunner:
                 self.settings.codex_executable,
                 "exec",
                 "--sandbox",
-                "workspace-write",
+                "danger-full-access",
                 "--ephemeral",
                 "--json",
                 "--output-last-message",
@@ -231,10 +231,12 @@ class CodexRunner:
             if not final_text:
                 final_text = "Codex completed without a final text summary."
             summary = final_text[:MAX_RESULT_CHARS]
-            next_state = (
-                JobState.PREPARED
-                if measurement.changed_files > 0
-                else JobState.SUCCEEDED
+            has_changes = measurement.changed_files > 0
+            next_state = JobState.PREPARED if has_changes else JobState.FAILED
+            completion_error = (
+                None
+                if has_changes
+                else "Codex completed but produced no repository changes; the requested change was not confirmed."
             )
             self.store.update(
                 job_id,
@@ -251,7 +253,7 @@ class CodexRunner:
                     diff=measurement,
                     diff_sha256=diff_sha256,
                     summary=summary,
-                    error=None,
+                    error=completion_error,
                     result_path=str(patch_path),
                 ),
             )

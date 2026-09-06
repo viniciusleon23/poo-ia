@@ -394,6 +394,7 @@ Las variables internas del worker, sus límites y rutas están explicados en [do
 - Un binario se considera fuera del presupuesto.
 - El checkout base debe estar limpio y no cambia de rama ni recibe commits.
 - Codex trabaja en `/home/poo/capnet-worktrees/<job_id>` sobre una rama `poo-ia/...`.
+- En esta primera fase de un solo propietario, Codex usa el acceso del usuario `poo`; el worktree aislado, el presupuesto de diff y la revisión previa al PR son los límites operativos.
 - La ejecución automática de comandos de prueba del repositorio permanece deshabilitada hasta contar con una sandbox dedicada; por ahora la validación se informa como `unavailable`.
 - Un diff fuera de presupuesto bloquea la publicación hasta una autorización posterior que identifique el trabajo y pida forzarla.
 

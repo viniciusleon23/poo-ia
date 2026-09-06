@@ -20,10 +20,11 @@ class DeploymentPolicyTests(unittest.TestCase):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
 
-        self.assertEqual(readme.count("--user 0:0 --cap-add CHOWN"), 1)
-        self.assertEqual(operations.count("--user 0:0 --cap-add CHOWN"), 2)
+        chown_helper = "--cap-add CHOWN --cap-add DAC_OVERRIDE"
+        self.assertEqual(readme.count(chown_helper), 1)
+        self.assertEqual(operations.count(chown_helper), 2)
         self.assertEqual(
-            operations.count("--user 0:0 --cap-add DAC_OVERRIDE"), 3
+            operations.count("--cap-add DAC_OVERRIDE"), 5
         )
         self.assertNotIn("--privileged", readme + operations)
 

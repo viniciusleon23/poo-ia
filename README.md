@@ -337,14 +337,15 @@ Construye e inicia Poo-IA:
 cd /home/poo/poo-ia
 docker compose config --quiet
 docker compose build
-docker compose run --rm --no-deps --user 0:0 --cap-add CHOWN discord-bot \
+docker compose run --rm --no-deps --user 0:0 \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE discord-bot \
   chown -R 10001:10001 /app/data
 docker compose up -d
 docker compose ps
 docker compose logs --tail=100 discord-bot
 ```
 
-El ajuste de propietario usa `CAP_CHOWN` únicamente en ese contenedor efímero para migrar un volumen creado por versiones anteriores que corrían como root. La aplicación normal corre como el usuario sin privilegios `10001`, sin capacidades Linux y con `no-new-privileges`. El volumen `poo-ia-data` conserva SQLite aunque se reconstruya el contenedor. No uses `docker compose down -v`, porque `-v` elimina esa memoria persistente.
+El ajuste de propietario usa únicamente `CAP_CHOWN` y `CAP_DAC_OVERRIDE` en ese contenedor efímero: la segunda capacidad es necesaria para atravesar un directorio `0700` que todavía pertenezca a otro UID y la primera cambia su propietario. La aplicación normal corre como el usuario sin privilegios `10001`, sin capacidades Linux y con `no-new-privileges`. El volumen `poo-ia-data` conserva SQLite aunque se reconstruya el contenedor. No uses `docker compose down -v`, porque `-v` elimina esa memoria persistente.
 
 Para que los servicios de usuario arranquen tras reiniciar la Beelink sin mantener una sesión SSH abierta, puede ser necesario habilitar una vez el *linger* de `poo` desde una cuenta con permisos administrativos:
 

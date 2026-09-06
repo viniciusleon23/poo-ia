@@ -309,7 +309,8 @@ docker compose stop discord-bot
 docker compose run --rm --no-deps --user 0:0 --cap-add DAC_OVERRIDE \
   -v /home/poo/backups/poo-ia:/backup:ro \
   discord-bot python -c 'import os,sqlite3; s=sqlite3.connect("file:/backup/poo-ia-backup.sqlite3?mode=ro",uri=True); d=sqlite3.connect(os.environ["POOIA_DB_PATH"]); s.backup(d); d.close(); s.close()'
-docker compose run --rm --no-deps --user 0:0 --cap-add CHOWN discord-bot \
+docker compose run --rm --no-deps --user 0:0 \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE discord-bot \
   chown -R 10001:10001 /app/data
 docker compose up -d discord-bot
 ```
@@ -355,7 +356,8 @@ systemctl --user start opencode-capnet poo-ia-worker
 
 docker compose config --quiet
 docker compose build
-docker compose run --rm --no-deps --user 0:0 --cap-add CHOWN discord-bot \
+docker compose run --rm --no-deps --user 0:0 \
+  --cap-add CHOWN --cap-add DAC_OVERRIDE discord-bot \
   chown -R 10001:10001 /app/data
 docker compose up -d
 docker compose ps

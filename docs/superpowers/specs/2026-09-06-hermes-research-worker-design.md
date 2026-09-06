@@ -1,6 +1,6 @@
 # Poo-IA: diseño del cerebro de consulta con Hermes
 
-**Fecha:** 2026-09-06  
+**Fecha:** 2026-09-06
 **Estado:** pendiente de revisión antes de implementar
 
 ## Objetivo

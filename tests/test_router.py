@@ -70,6 +70,9 @@ class RouterTests(unittest.TestCase):
             "¿Cómo estás?",
             "muchas gracias",
             "hasta luego",
+            "¿Sigues vivo?",
+            "¿Sigues ahí?",
+            "¿Estás ahí?",
         )
 
         for message in messages:

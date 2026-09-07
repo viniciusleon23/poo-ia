@@ -42,6 +42,9 @@ SMALL_TALK = frozenset(
         "hola mundo",
         "muchas gracias",
         "que tal",
+        "sigues vivo",
+        "sigues ahi",
+        "estas ahi",
     }
 )
 

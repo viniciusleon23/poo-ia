@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import binascii
 import hmac
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from aiohttp import web
 
 from .config import WorkerSettings
+from .aws_queries import AwsQueries
 from .github import PublicationError
 from .manager import JobManager
 from .models import JobRequest
@@ -22,6 +24,7 @@ from .store import (
 
 MANAGER_KEY: web.AppKey[JobManager] = web.AppKey("manager", JobManager)
 SETTINGS_KEY: web.AppKey[WorkerSettings] = web.AppKey("settings", WorkerSettings)
+AWS_QUERIES_KEY: web.AppKey[AwsQueries] = web.AppKey("aws_queries", AwsQueries)
 
 
 def _error(message: str, *, status: int) -> web.Response:
@@ -126,6 +129,17 @@ async def list_repositories(request: web.Request) -> web.Response:
     return web.json_response({"repositories": list(names)})
 
 
+async def query_aws(request: web.Request) -> web.Response:
+    payload = await _json_object(request)
+    if set(payload) - {"action", "table", "log_group"} or not isinstance(payload.get("action"), str):
+        raise ValueError("La consulta AWS requiere una operación permitida y el recurso correspondiente.")
+    result = await asyncio.to_thread(
+        request.app[AWS_QUERIES_KEY].query,
+        payload["action"], table=payload.get("table"), log_group=payload.get("log_group"),
+    )
+    return web.json_response({"result": result})
+
+
 async def get_job(request: web.Request) -> web.Response:
     manifest = await request.app[MANAGER_KEY].get(request.match_info["job_id"])
     return web.json_response({"job": manifest.to_public_dict()})
@@ -156,6 +170,7 @@ def create_app(
     settings: WorkerSettings,
     *,
     manager: JobManager | None = None,
+    aws_queries: AwsQueries | None = None,
 ) -> web.Application:
     application = web.Application(
         middlewares=(error_middleware, authentication_middleware),
@@ -163,8 +178,10 @@ def create_app(
     )
     application[SETTINGS_KEY] = settings
     application[MANAGER_KEY] = manager or JobManager(settings)
+    application[AWS_QUERIES_KEY] = aws_queries or AwsQueries(settings)
     application.router.add_get("/healthz", health)
     application.router.add_get("/v1/repositories", list_repositories)
+    application.router.add_post("/v1/aws/query", query_aws)
     application.router.add_post("/v1/jobs/codex", create_codex_job)
     application.router.add_get("/v1/jobs/{job_id}", get_job)
     application.router.add_post("/v1/jobs/{job_id}/cancel", cancel_job)

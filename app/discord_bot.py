@@ -172,6 +172,7 @@ class PooIAClient(discord.Client):
             content_root=self.settings.content_root,
             opencode=self._opencode,
             worker=self._worker,
+            aws_enabled=self.settings.aws_enabled,
             repositories=repositories,
             worker_poll_seconds=self.settings.worker_poll_seconds,
         )

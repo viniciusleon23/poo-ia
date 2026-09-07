@@ -103,12 +103,17 @@ class FakeOpenCode:
 
 class FakeWorker:
     def __init__(self) -> None:
+        self.aws_calls: list[tuple[str, str | None, str | None]] = []
         self.create_calls: list[dict[str, object]] = []
         self.get_calls: list[str] = []
         self.cancel_calls: list[str] = []
         self.publish_calls: list[tuple[str, bool]] = []
         self.polls: dict[str, list[dict[str, object]]] = {}
         self.cancel_result: dict[str, object] | None = None
+
+    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None):
+        self.aws_calls.append((action, table, log_group))
+        return {"state": "succeeded", "message": "Tabla Tasks: ACTIVE (metadatos)."}
 
     async def create_codex_job(self, **kwargs: object):
         self.create_calls.append(dict(kwargs))
@@ -1099,6 +1104,80 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(snapshot.conversation.active_repository)
         self.assertIsNone(snapshot.conversation.last_job_id)
 
+    async def test_aws_runs_only_on_host_and_never_enters_model_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        submission = await self.orchestrator.handle(InboundMessage(
+            930, 100, 200, "describe la tabla Tasks en DynamoDB"
+        ))
+        self.assertEqual(submission.intent, Intent.AWS_REPORT)
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.worker.aws_calls, [("describe-dynamodb", "Tasks", None)])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(await self.flush_all(), ["Tabla Tasks: ACTIVE (metadatos)."])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertIsNone(self.storage.get_conversation(KEY).active_repository)
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_duplicate_aws_request_is_idempotent_and_preserves_execution_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        self.storage.set_conversation_context(KEY, active_repository="capnet-next-lambda-tasks")
+        message = InboundMessage(933, 100, 200, "lista tablas de DynamoDB")
+        first = await self.orchestrator.handle(message)
+        await self.flush_all()
+        duplicate = await self.orchestrator.handle(message)
+        self.assertTrue(first.created)
+        self.assertFalse(duplicate.created)
+        self.assertEqual(self.worker.aws_calls, [("list-dynamodb", None, None)])
+        self.assertEqual(await self.flush_all(), [])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.storage.get_conversation(KEY).active_repository, "capnet-next-lambda-tasks")
+
+    async def test_record_and_log_reads_stay_out_of_models_memory_and_brain(self) -> None:
+        self.orchestrator.aws_enabled = True
+        for message_id, text in ((936, "consulta registros de la tabla Tasks en DynamoDB"), (937, "ver logs del grupo /aws/lambda/tasks en CloudWatch")):
+            await self.orchestrator.handle(InboundMessage(message_id, 100, 200, text))
+            await self.flush_all()
+        self.assertEqual(self.worker.aws_calls, [("scan-dynamodb", "Tasks", None), ("read-logs", None, "/aws/lambda/tasks")])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_identity_and_lambda_requests_do_not_reach_worker(self) -> None:
+        self.orchestrator.aws_enabled = True
+        for message_id, text in ((938, "consulta mi identidad AWS"), (939, "lista las lambdas")):
+            await self.orchestrator.handle(InboundMessage(message_id, 100, 200, text))
+            self.assertIn("DynamoDB y CloudWatch", " ".join(await self.flush_all()))
+        self.assertEqual(self.worker.aws_calls, [])
+
+    async def test_capabilities_announce_aws_only_when_enabled(self) -> None:
+        await self.orchestrator.handle(InboundMessage(934, 100, 200, "¿Qué puedes hacer?"))
+        self.assertNotIn("consultar DynamoDB", " ".join(await self.flush_all()))
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(935, 100, 200, "¿Qué puedes hacer?"))
+        self.assertIn("consultar DynamoDB", " ".join(await self.flush_all()))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_aws_unsupported_requests_explain_allowlist_without_a_model(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(931, 100, 200, "elimina todas las tablas de DynamoDB"))
+        self.assertEqual(self.worker.aws_calls, [])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertIn("Operaciones disponibles", " ".join(await self.flush_all()))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_aws_transport_failure_never_echoes_raw_error(self) -> None:
+        self.orchestrator.aws_enabled = True
+        async def fail(*args, **kwargs):
+            raise RuntimeError("raw-credential-value")
+        self.worker.query_aws = fail
+        await self.orchestrator.handle(InboundMessage(932, 100, 200, "lista tablas de DynamoDB"))
+        text = " ".join(await self.flush_all())
+        self.assertNotIn("raw-credential-value", text)
+        self.assertIn("No pude", text)
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
     async def test_aws_is_explicitly_disabled_without_touching_worker(self) -> None:
         result = await self.orchestrator.handle(
             InboundMessage(14, 100, 200, "haz un reporte de DynamoDB")
@@ -1106,7 +1185,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         sent = await self.flush_all()
 
         self.assertEqual(result.intent, Intent.AWS_REPORT)
-        self.assertTrue(any("pospuesta" in text for text in sent))
+        self.assertTrue(any("desactivadas" in text for text in sent))
         self.assertEqual(self.worker.create_calls, [])
 
     async def test_wait_for_output_observes_background_completion(self) -> None:

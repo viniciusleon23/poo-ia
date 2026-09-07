@@ -52,6 +52,25 @@ def make_client(session: FakeSession) -> WorkerClient:
 
 
 class WorkerClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cloudwatch_query_sends_named_group_only(self) -> None:
+        session = FakeSession(FakeResponse(200, {"result": {"state": "succeeded", "message": "Logs acotados"}}))
+        await make_client(session).query_aws("read-logs", log_group="/aws/lambda/tasks")
+        self.assertEqual(session.calls[0][2]["json"], {"action": "read-logs", "log_group": "/aws/lambda/tasks"})
+    async def test_aws_query_sends_only_action_and_table_and_returns_public_report(self) -> None:
+        session = FakeSession(FakeResponse(200, {"result": {
+            "state": "succeeded", "message": "Tabla Tasks activa", "unused": "private-extra",
+        }}))
+        report = await make_client(session).query_aws("describe-dynamodb", table="Tasks")
+        self.assertEqual(report, {"state": "succeeded", "message": "Tabla Tasks activa"})
+        method, url, kwargs = session.calls[0]
+        self.assertEqual((method, url), ("POST", "http://127.0.0.1:4097/v1/aws/query"))
+        self.assertEqual(kwargs["json"], {"action": "describe-dynamodb", "table": "Tasks"})
+
+    async def test_aws_query_rejects_malformed_or_unbounded_reports(self) -> None:
+        for report in ({}, {"state": "succeeded", "message": {}}, {"state": "succeeded", "message": "x" * 16_001}):
+            with self.subTest(report=report):
+                with self.assertRaises(WorkerError):
+                    await make_client(FakeSession(FakeResponse(200, {"result": report}))).query_aws("identity")
     async def test_creates_codex_job_with_basic_auth_and_preflight(self) -> None:
         session = FakeSession(
             FakeResponse(202, {"job": {"job_id": "job-1", "status": "queued"}})

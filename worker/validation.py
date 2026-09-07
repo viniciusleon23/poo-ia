@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .models import DiffMeasurement, ValidationResult, ValidationStatus
 from .processes import CommandRunner, CommandTimedOut, SubprocessCommandRunner
+from .validation_sandbox import DockerValidationRunner, ValidationSandboxError
 
 
 MAX_LOG_BYTES = 1_000_000
@@ -72,6 +73,8 @@ def detect_test_command(repository: Path) -> tuple[str, ...] | None:
         or (repository / "pytest.ini").is_file()
         or (repository / "setup.cfg").is_file()
     ):
+        if (repository / "uv.lock").is_file():
+            return ("uv", "run", "--offline", "--no-sync", "--no-env-file", "python", "-m", "pytest")
         return ("python3", "-m", "pytest")
     if (repository / "tests").is_dir():
         return ("python3", "-m", "unittest", "discover", "-s", "tests")
@@ -86,11 +89,13 @@ class Validator:
         runner: CommandRunner | None = None,
         timeout_seconds: float = 600.0,
         enabled: bool = False,
+        test_runner: DockerValidationRunner | None = None,
     ) -> None:
         self.git = git_executable
         self.runner = runner or SubprocessCommandRunner()
         self.timeout_seconds = timeout_seconds
         self.enabled = enabled
+        self.test_runner = test_runner
 
     def validate(
         self,
@@ -109,6 +114,12 @@ class Validator:
                 ),
             )
 
+        if self.test_runner is None:
+            return ValidationResult(
+                ValidationStatus.UNAVAILABLE,
+                detail="No isolated test runner is configured; host execution is prohibited.",
+            )
+
         log_path = job_directory / "validation.log"
         baseline_path = job_directory / "baseline"
         baseline_added = False
@@ -116,6 +127,8 @@ class Validator:
             add = self.runner.run(
                 (
                     self.git,
+                    "-c", "core.hooksPath=/dev/null",
+                    "-c", "submodule.recurse=false",
                     "-C",
                     str(base_repository),
                     "worktree",
@@ -139,7 +152,17 @@ class Validator:
                 )
 
             try:
-                changed = self.runner.run(
+                isolated = self.test_runner.prepare(baseline_path)
+            except (OSError, CommandTimedOut) as error:
+                return ValidationResult(
+                    ValidationStatus.UNAVAILABLE,
+                    command=command,
+                    detail=(str(error) if isinstance(error, ValidationSandboxError)
+                            else "Could not prepare the isolated validation environment."),
+                )
+
+            try:
+                changed = isolated.run(
                     command, cwd=worktree, timeout=self.timeout_seconds
                 )
             except CommandTimedOut:
@@ -150,13 +173,14 @@ class Validator:
                     log_path=str(log_path),
                     detail="Validation exceeded its configured timeout.",
                 )
-            except OSError:
+            except OSError as error:
                 _write_private(log_path, "Validation command is unavailable.\n")
                 return ValidationResult(
                     ValidationStatus.UNAVAILABLE,
                     command=command,
                     log_path=str(log_path),
-                    detail="The detected validation command is not installed.",
+                    detail=(str(error) if isinstance(error, ValidationSandboxError)
+                            else "The isolated validation command is unavailable."),
                 )
 
             changed_output = changed.stdout + "\n" + changed.stderr
@@ -172,7 +196,7 @@ class Validator:
             baseline_exit: int | None = None
             baseline_output: str | None = None
             try:
-                baseline = self.runner.run(
+                baseline = isolated.run(
                     command, cwd=baseline_path, timeout=self.timeout_seconds
                 )
                 baseline_exit = baseline.returncode

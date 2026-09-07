@@ -466,11 +466,28 @@ class GitHubPublisherTests(unittest.TestCase):
         self.prepare("discord-908")
         (self.worktree / "Makefile").write_text("test:\n\t@false\n", encoding="utf-8")
         commands = FakePublicationRunner(validation_failure=True)
+
+        class FakeHostGit:
+            def run(self, argv, **kwargs):
+                if tuple(argv[1:5]) == (
+                    "-c", "core.hooksPath=/dev/null", "-c", "submodule.recurse=false",
+                ):
+                    argv = (argv[0], *argv[5:])
+                return commands.run(argv, **kwargs)
+
+        class FakeIsolatedRunner:
+            def prepare(self, _repository):
+                return self
+
+            def run(self, argv, **kwargs):
+                return commands.run(argv, **kwargs)
+
         validator = Validator(
             git_executable=self.settings.git_executable,
-            runner=commands,
+            runner=FakeHostGit(),
             timeout_seconds=self.settings.validation_timeout_seconds,
             enabled=True,
+            test_runner=FakeIsolatedRunner(),
         )
 
         with self.assertRaisesRegex(PublicationError, "validation is failed"):

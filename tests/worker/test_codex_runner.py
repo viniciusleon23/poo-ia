@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Sequence
@@ -18,6 +19,8 @@ from worker.processes import (
     SubprocessCommandRunner,
 )
 from worker.store import ManifestStore
+from worker.github import GitHubPublisher
+from worker.validation_sandbox import DockerValidationRunner
 
 
 def git(cwd: Path, *arguments: str) -> str:
@@ -116,6 +119,13 @@ class CodexRunnerTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_validation_activation_applies_to_changes_and_publication(self) -> None:
+        settings = replace(self.settings, validation_enabled=True)
+        for operation in (CodexRunner(settings, self.store), GitHubPublisher(settings, self.store)):
+            self.assertTrue(operation.validator.enabled)
+            self.assertIsInstance(operation.validator.test_runner, DockerValidationRunner)
+            self.assertEqual(operation.validator.test_runner.staging_root, settings.data_root / "validation")
 
     def test_prepares_change_with_codex_flags_context_and_diff(self) -> None:
         request = JobRequest(

@@ -2,7 +2,7 @@
 
 Este manual cubre el despliegue actual de una sola persona en la Beelink Ubuntu. La interfaz es Discord; la base persistente vive en Docker y OpenCode/Codex/GitHub viven en el host.
 
-AWS no forma parte de este procedimiento. `AWS_ENABLED` debe permanecer en `false` y ninguna comprobación de este manual requiere credenciales AWS.
+Las consultas AWS son optativas y de solo lectura. Se habilitan en núcleo y worker con `AWS_ENABLED=true`; el perfil existe únicamente en el host. Las pruebas utilizan Docker y credenciales ficticias.
 
 ## Rutas y servicios
 
@@ -173,7 +173,9 @@ Antes y después de la prueba de cambio, el checkout base debe conservar la mism
 
 La forma preferida de consultar el último trabajo es escribir `cómo va` en Discord. Para uno anterior, incluye el ID corto que mostró el bot. Los mensajes duplicados de Discord y los reintentos HTTP conservan el mismo identificador; no crean otro cambio ni otro PR.
 
-En esta fase los comandos de prueba provenientes de repositorios no se ejecutan automáticamente: la validación queda en `unavailable` hasta que exista una sandbox dedicada para ellos. El detector se conserva para pruebas internas, pero no se confía en `AGENTS.md`, `Makefile` ni scripts del repositorio durante la operación normal.
+Con `VALIDATION_ENABLED=true`, el validador prepara una imagen de dependencias desde `pyproject.toml`, `uv.lock` y la versión Python del commit base. Reutiliza la imagen por huella de metadatos. La construcción usa un Dockerfile controlado y no recibe credenciales ni el HOME del usuario. Las pruebas corren sin red, con límites de memoria, CPU, procesos y tiempo, raíz de solo lectura y una copia efímera del repositorio. El staging vive bajo `WORKER_DATA_ROOT/validation` para ser visible al daemon Docker con `PrivateTmp=true`. La cancelación y recuperación limpian los contenedores propios; el límite interno termina contenedores si desaparece su cliente.
+
+El soporte automático inicial es para proyectos Python con uv. Un entorno incompatible o Docker no disponible produce `unavailable` con diagnóstico; nunca se ejecutan pruebas en el host como alternativa. Los fallos se comparan con el commit base y el resultado real se conserva en el manifiesto y la bitácora.
 
 La cancelación aplica a trabajos `queued` o `running`. Un trabajo `prepared` ya no está ejecutándose: conserva el worktree para revisión, publicación posterior o limpieza manual.
 
@@ -404,7 +406,7 @@ Si el commit anterior no reconoce la versión de SQLite, restaura la copia `pre-
 | Codex pide login | Ejecuta `codex login --device-auth` como `poo` y confirma `codex login status`. |
 | No puede hacer push o PR | Revisa `gh auth status`, el remoto Git y `ssh -T git@github.com`. |
 | Cambio queda `prepared` | Revisa validación y presupuesto; publica después con una orden que identifique el trabajo. |
-| Mensaje AWS no se ejecuta | Es el comportamiento esperado de esta fase; `AWS_ENABLED=true` está rechazado. |
+| Mensaje AWS no se ejecuta | Verifica `AWS_ENABLED=true` en núcleo y worker, AWS CLI en PATH y el perfil del usuario. Operaciones no admitidas devuelven ayuda; errores IAM se muestran sin credenciales. |
 | Memoria desapareció | Revisa el volumen, que no se haya usado `down -v` y que no se haya enviado la frase de olvido. |
 
 ## Configuración del worker
@@ -427,9 +429,16 @@ Si el commit anterior no reconoce la versión de SQLite, restaura la copia `pre-
 | `CODEX_MAX_CHANGED_LINES` | `400`. |
 | `CODEX_TIMEOUT_SECONDS` | `1800`. |
 | `VALIDATION_TIMEOUT_SECONDS` | `600`. |
+| `VALIDATION_ENABLED` | `false` por defecto; activa el ejecutor Docker con uv. |
+| `VALIDATION_BUILD_TIMEOUT_SECONDS` | `600`; máximo de preparación de dependencias. |
+| `DOCKER_EXECUTABLE` | `/usr/bin/docker` en el servidor. |
+| `AWS_ENABLED` | `false`; activar en núcleo y worker. |
+| `AWS_CLI_EXECUTABLE` | `/home/poo/.local/bin/aws` en el servidor. |
+| `AWS_PROFILE` / `AWS_REGION` | `default` / `us-east-1`; solo en el worker. |
+| `AWS_QUERY_TIMEOUT_SECONDS` | `20`; menor que el timeout HTTP del núcleo. |
 | `GITHUB_TIMEOUT_SECONDS` | `120`. |
 | `WORKER_POLL_SECONDS` | `0.5` en el host. |
 
 El núcleo elimina al arrancar y después cada hora la memoria que supera `MEMORY_RETENTION_DAYS` y las solicitudes o trabajos terminales ya entregados que superan su propio `OPERATIONAL_RETENTION_DAYS` de `.env`. El worker usa la variable homónima de `worker.env` para manifiestos, artefactos, worktrees y ramas locales terminales. Ambos valores son 30 días por defecto, pero se configuran por separado. Los trabajos activos, preparados o con salida de Discord pendiente nunca se eliminan por antigüedad; el worker tampoco elimina ramas remotas.
 
-No añadas variables AWS al archivo del worker en esta fase.
+Configura solo el nombre de perfil y región en `worker.env`. Mantén las claves en los archivos privados estándar de AWS del usuario; no las copies a `.env`, Git, logs, prompts ni Discord. Las operaciones permitidas se limitan a DynamoDB (tablas y muestras de hasta diez registros evaluados) y CloudWatch Logs (grupos y hasta veinte eventos de la última hora). No hay escrituras; cualquier modificación requiere una instrucción explícita adicional. Las respuestas acotan y ocultan patrones comunes de credenciales, sin enviar datos a modelos ni memoria.

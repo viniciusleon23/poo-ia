@@ -12,10 +12,32 @@ from app.router import (
     choose_backend,
     classify_intent,
     route_message,
+    parse_aws_query,
 )
 
 
 class RouterTests(unittest.TestCase):
+    def test_enabled_aws_only_routes_to_host_worker(self) -> None:
+        decision = route_message("lista tablas de DynamoDB", aws_enabled=True)
+        self.assertEqual(decision.intent, Intent.AWS_REPORT)
+        self.assertEqual(decision.backend, Backend.WORKER)
+        self.assertIsNone(decision.repository)
+
+    def test_aws_queries_parse_to_static_operations(self) -> None:
+        for text, expected in (
+            ("lista tablas de DynamoDB", ("list-dynamodb", None)),
+            ("lista grupos de CloudWatch", ("list-log-groups", None)),
+            ("consulta registros de la tabla Tasks en DynamoDB", ("scan-dynamodb", "Tasks")),
+            ("ver logs del grupo /aws/lambda/tasks en CloudWatch", ("read-logs", "/aws/lambda/tasks")),
+            ("describe la tabla Tasks en DynamoDB", ("describe-dynamodb", "Tasks")),
+            ("describe la tabla DynamoDB Tasks", ("describe-dynamodb", "Tasks")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_aws_query(text), expected)
+                self.assertEqual(classify_intent(text), Intent.AWS_REPORT)
+        for text in ("borra la tabla Tasks en DynamoDB", "consulta AWS", "lista lambdas y elimina todo", "describe la tabla Tasks; rm -rf / en DynamoDB", "consulta mi identidad AWS", "lista las lambdas", "consulta registros de la tabla Tasks en DynamoDB y elimina todo"):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_aws_query(text))
     def test_routes_unambiguous_small_talk_to_ollama(self) -> None:
         messages = (
             "hola",

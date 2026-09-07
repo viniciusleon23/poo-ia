@@ -16,6 +16,7 @@ from .processes import (
 )
 from .store import ManifestStateError, ManifestStore
 from .validation import Validator
+from .validation_sandbox import DockerValidationRunner
 
 
 class PublicationError(RuntimeError):
@@ -41,6 +42,15 @@ class GitHubPublisher:
             git_executable=settings.git_executable,
             runner=self.runner,
             timeout_seconds=settings.validation_timeout_seconds,
+            enabled=settings.validation_enabled,
+            test_runner=(
+                DockerValidationRunner(
+                    staging_root=settings.data_root / "validation",
+                    docker_executable=settings.docker_executable,
+                    build_timeout_seconds=settings.validation_build_timeout_seconds,
+                )
+                if settings.validation_enabled else None
+            ),
         )
 
     def publish(

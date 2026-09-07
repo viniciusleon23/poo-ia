@@ -54,9 +54,33 @@ class WorkerSettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(WorkerConfigurationError, message):
                     WorkerSettings.from_environment(environment)
 
-    def test_has_no_cloud_credentials_or_cloud_endpoint_fields(self) -> None:
+    def test_cloud_configuration_has_no_credential_or_endpoint_fields(self) -> None:
         field_names = set(WorkerSettings.__dataclass_fields__)
-        self.assertFalse(any("aws" in name.casefold() for name in field_names))
+        self.assertFalse(any(
+            any(part in name for part in ("access_key", "secret_key", "session_token", "endpoint"))
+            for name in field_names
+        ))
+
+    def test_enables_isolated_validation_and_host_aws_queries(self) -> None:
+        settings = WorkerSettings.from_environment(self.base_environment() | {
+            "VALIDATION_ENABLED": "true", "AWS_ENABLED": "true",
+            "AWS_PROFILE": "default", "AWS_REGION": "us-east-1",
+            "AWS_QUERY_TIMEOUT_SECONDS": "15", "VALIDATION_BUILD_TIMEOUT_SECONDS": "300",
+        })
+        self.assertTrue(settings.validation_enabled)
+        self.assertTrue(settings.aws_enabled)
+        self.assertEqual(settings.aws_profile, "default")
+        self.assertEqual(settings.aws_region, "us-east-1")
+        self.assertEqual(settings.aws_query_timeout_seconds, 15)
+        self.assertEqual(settings.validation_build_timeout_seconds, 300)
+
+    def test_rejects_invalid_validation_and_aws_options(self) -> None:
+        for name, value in (("VALIDATION_ENABLED", "maybe"), ("AWS_ENABLED", "maybe"),
+                            ("AWS_PROFILE", "--endpoint-url"), ("AWS_REGION", "bad region"),
+                            ("AWS_QUERY_TIMEOUT_SECONDS", "nan"),
+                            ("VALIDATION_BUILD_TIMEOUT_SECONDS", "0")):
+            with self.subTest(name=name), self.assertRaisesRegex(WorkerConfigurationError, name):
+                WorkerSettings.from_environment(self.base_environment() | {name: value})
 
     def test_accepts_worker_retention_configuration(self) -> None:
         settings = WorkerSettings.from_environment(

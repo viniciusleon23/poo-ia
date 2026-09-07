@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
+from unittest.mock import Mock
 
 from worker.config import WorkerSettings
 from worker.manager import JobManager
@@ -156,6 +157,32 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(cancelled.state, JobState.CANCELLED)
         self.assertEqual(self.processes.terminated, [104])
+
+    async def test_cancel_cleans_changed_and_baseline_containers_after_stopping_job(self) -> None:
+        self.store.create_or_get(JobRequest("discord-1191", "repo", "change"))
+        worktree = self.settings.worktrees_root / "discord-1191"
+        self.store.update(
+            "discord-1191", expected=(JobState.QUEUED,),
+            transform=lambda item: item.evolve(
+                state=JobState.RUNNING, process_pid=191, worktree=str(worktree)
+            ),
+        )
+        self.processes.alive.add(191)
+        self.processes.owners[191] = "discord-1191"
+        cleanup = Mock()
+        cleanup.cleanup_for_repository.side_effect = lambda path: self.assertNotIn(191, self.processes.alive)
+        self.manager._validation_sandbox = cleanup
+        await self.manager.cancel("discord-1191")
+        self.assertEqual(
+            {call.args[0] for call in cleanup.cleanup_for_repository.call_args_list},
+            {worktree.resolve(), self.store.root / "discord-1191" / "baseline"},
+        )
+
+    async def test_start_recovers_orphan_validation_containers(self) -> None:
+        cleanup = Mock()
+        self.manager._validation_sandbox = cleanup
+        await self.manager.start()
+        cleanup.cleanup_orphans.assert_called_once_with()
 
     async def test_cancel_publication_stops_owned_group_and_preserves_prepared_change(self) -> None:
         self.store.create_or_get(JobRequest("discord-1107", "repo", "change"))

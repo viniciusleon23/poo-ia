@@ -72,6 +72,26 @@ class WorkerClient:
             raise WorkerError("The worker returned an invalid repository inventory.")
         return tuple(repositories)
 
+    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None) -> dict[str, object]:
+        """Request one fixed read operation; credentials stay on the host."""
+        payload: dict[str, object] = {"action": action}
+        if table is not None:
+            payload["table"] = table
+        if log_group is not None:
+            payload["log_group"] = log_group
+        response = await self._request_json("POST", "/v1/aws/query", payload)
+        report = response.get("result")
+        if (
+            not isinstance(report, dict)
+            or report.get("state") not in {"succeeded", "failed", "disabled"}
+            or not isinstance(report.get("message"), str)
+            or not report["message"].strip()
+            or len(report["message"]) > 16_000
+        ):
+            raise WorkerError("El worker devolvió una respuesta AWS inválida.")
+        # Only the public report is exposed to the core, never other API fields.
+        return {"state": report["state"], "message": report["message"]}
+
     async def create_codex_job(
         self,
         *,

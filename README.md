@@ -2,7 +2,7 @@
 
 Poo-IA es un asistente personal que usa Discord como primera interfaz. Escucha mensajes normales, sin prefijo `!`, exclusivamente en un canal y para un propietario configurados. Mantiene memoria entre reinicios, consulta la documentación de Capnet y puede preparar cambios pequeños mediante Codex CLI en worktrees aislados.
 
-La integración con AWS y DynamoDB está deliberadamente desactivada en esta fase. El sistema principal no instala AWS CLI, no necesita un perfil AWS y no lee, copia ni modifica credenciales AWS.
+El worker permite consultas AWS de solo lectura cuando se activa explícitamente. AWS CLI y el perfil permanecen en el host; el núcleo no recibe claves. La validación automática de repositorios Python con uv se ejecuta en contenedores separados, sin red ni credenciales.
 
 ## Arquitectura
 
@@ -40,7 +40,7 @@ El repositorio está organizado así:
 ```text
 app/          Núcleo, Discord, memoria, SQLite, router y clientes HTTP
 worker/       Worker local de Codex, Git, validación y GitHub
-rules/        Reglas editables de memoria, investigación, cambios y AWS futuro
+rules/        Reglas editables de memoria, investigación, cambios y consultas AWS
 personality/  Voz y personalidad de Poo-IA
 opencode/     Configuración del investigador documental de solo lectura
 ops/          Servicios systemd y ejemplo privado del worker
@@ -394,7 +394,7 @@ sudo loginctl enable-linger poo
 | `WORKER_SERVER_PASSWORD` | Con worker | Secreto de al menos 16 caracteres compartido con `WORKER_PASSWORD`. |
 | `WORKER_TIMEOUT_SECONDS` | No | Timeout de cada llamada HTTP; por defecto 30 s. |
 | `WORKER_POLL_SECONDS` | No | Intervalo de consulta de trabajos; por defecto 2 s. |
-| `AWS_ENABLED` | No | Su valor predeterminado es `false`; `true` impide iniciar por diseño. |
+| `AWS_ENABLED` | No | Por defecto `false`; activa consultas de solo lectura mediante el worker. Requiere `WORKER_ENABLED=true` y activación también en `worker.env`. |
 
 Las variables internas del worker, sus límites y rutas están explicados en [docs/operations.md](docs/operations.md).
 
@@ -407,7 +407,7 @@ Las variables internas del worker, sus límites y rutas están explicados en [do
 - El checkout base debe estar limpio y no cambia de rama ni recibe commits.
 - Codex trabaja en `/home/poo/capnet-worktrees/<job_id>` sobre una rama `poo-ia/...`.
 - En esta primera fase de un solo propietario, Codex usa el acceso del usuario `poo`; el worktree aislado, el presupuesto de diff y la revisión previa al PR son los límites operativos.
-- La ejecución automática de comandos de prueba del repositorio permanece deshabilitada hasta contar con una sandbox dedicada; por ahora la validación se informa como `unavailable`.
+- Con `VALIDATION_ENABLED=true`, las pruebas de proyectos uv se ejecutan automáticamente en Docker con Python y dependencias del proyecto, sin red y sobre una copia efímera del código. Un entorno no compatible se informa como `unavailable`; nunca se ejecutan pruebas en el host como alternativa.
 - Un diff fuera de presupuesto bloquea la publicación hasta una autorización posterior que identifique el trabajo y pida forzarla.
 
 Los límites no borran el resultado: el trabajo queda `prepared` para inspección. Los reintentos con el mismo ID son idempotentes; no crean otra ejecución, rama o PR.
@@ -443,11 +443,13 @@ codex login status
 gh auth status
 ```
 
-## AWS queda fuera de esta fase
+## Consultas AWS de solo lectura
 
-No añadas `AWS_PROFILE`, `AWS_REGION`, claves ni archivos de credenciales para validar esta entrega. Las solicitudes sobre AWS o DynamoDB reciben una respuesta determinista que indica que la integración está pospuesta.
+Activa `AWS_ENABLED=true` en `.env` y en el archivo privado `worker.env`. El núcleo requiere el worker autenticado. Solo el worker ejecuta AWS CLI con el perfil del usuario del servidor; las claves permanecen en `~/.aws/credentials` y no se montan en el núcleo ni en los contenedores de pruebas.
 
-Cuando el propietario abra esa fase, el worker usará la cadena estándar de credenciales del usuario `poo` y exactamente los permisos de su identidad configurada. Ese trabajo posterior añadirá verificación con STS, operaciones DynamoDB paginadas e informes; no requiere cambiar la autenticación actual de Discord, memoria, OpenCode o Codex.
+AWS se limita a DynamoDB y CloudWatch Logs. Permite listar y describir tablas, consultar una muestra acotada de registros de una tabla explícita, listar grupos de logs y leer eventos recientes de un grupo explícito. El endpoint autenticado `/v1/aws/query` acepta acciones predefinidas, nunca comandos libres. Las respuestas muestran campos seleccionados y avisan si el listado está limitado. Las lecturas de registros evalúan como máximo diez elementos; los logs se limitan a veinte eventos de la última hora, con texto acotado. No hay operaciones de escritura. Una modificación requiere una instrucción explícita adicional y no se ejecuta por activar las consultas. Las respuestas AWS no se incorporan a la memoria conversacional ni se envían a modelos.
+
+Ejemplos: `lista las tablas DynamoDB`, `describe la tabla DynamoDB nombre-tabla`, `consulta registros de la tabla nombre-tabla en DynamoDB`, `lista grupos de CloudWatch`, `ver logs del grupo /aws/lambda/servicio en CloudWatch`.
 
 ## Secretos y datos privados
 

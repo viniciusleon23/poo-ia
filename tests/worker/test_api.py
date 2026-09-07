@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+from dataclasses import replace
 from pathlib import Path
 
 from aiohttp import BasicAuth
 from aiohttp.test_utils import TestClient, TestServer
 
 from worker.api import create_app
+from worker.aws_queries import AwsQueries
+from worker.processes import CommandResult
+from tests.worker.test_aws_queries import FakeRunner
 from worker.config import WorkerSettings
 from worker.models import JobManifest, JobRequest, JobState
 from worker.store import IdempotencyConflictError, ManifestNotFoundError
@@ -102,6 +107,35 @@ class WorkerApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(wrong.status, 401)
         self.assertEqual(accepted.status, 200)
         self.assertEqual((await accepted.json())["status"], "ok")
+
+    async def test_aws_endpoint_is_authenticated_and_disabled_by_default(self) -> None:
+        rejected = await self.client.post("/v1/aws/query", json={"action": "identity"})
+        disabled = await self.client.post(
+            "/v1/aws/query", headers=self.auth_headers, json={"action": "identity"}
+        )
+        self.assertEqual(rejected.status, 401)
+        self.assertEqual(disabled.status, 200)
+        self.assertEqual((await disabled.json())["result"]["state"], "disabled")
+
+    async def test_aws_endpoint_accepts_only_structured_allowlisted_operation(self) -> None:
+        enabled = replace(self.settings, aws_enabled=True)
+        runner = FakeRunner(CommandResult(0, json.dumps({"TableNames": ["Tasks"]})))
+        client = TestClient(TestServer(create_app(
+            enabled, manager=FakeManager(), aws_queries=AwsQueries(enabled, runner=runner)
+        )))
+        await client.start_server()
+        try:
+            accepted = await client.post(
+                "/v1/aws/query", headers=self.auth_headers, json={"action": "list-dynamodb"}
+            )
+            self.assertEqual(accepted.status, 200)
+            self.assertIn("Tasks", (await accepted.json())["result"]["message"])
+            for payload in ({"action": "delete-table"}, {"action": "identity"}, {"action": "list-lambdas"}, {"action": "list-dynamodb", "argv": ["whoami"]}, {"action": "describe-dynamodb", "table": "$(secret)"}, {"action": "read-logs", "log_group": "$(secret)"}):
+                rejected = await client.post("/v1/aws/query", headers=self.auth_headers, json=payload)
+                self.assertEqual(rejected.status, 400)
+            self.assertEqual(len(runner.calls), 1)
+        finally:
+            await client.close()
 
     async def test_create_get_cancel_and_idempotent_retry(self) -> None:
         payload = {

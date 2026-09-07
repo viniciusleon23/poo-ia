@@ -60,7 +60,10 @@ STATUS_PHRASES = frozenset(
     }
 )
 
-_AWS_PATTERN = re.compile(r"\b(?:aws|dynamo\s*db|dynamodb|amazon web services)\b")
+_AWS_PATTERN = re.compile(r"\b(?:aws|dynamo\s*db|dynamodb|cloud\s*watch|sts|amazon web services)\b")
+_AWS_DISCOVERY_PATTERN = re.compile(
+    r"\b(?:lista|listar|muestra|consulta|que|cuantas)\b.*\b(?:lambdas|funciones lambda)\b"
+)
 _PR_PATTERN = re.compile(
     r"^(?:por favor\s+)?(?:"
     r"(?:arma|abre|crea|publica|sube|haz)\s+(?:el\s+|un\s+)?(?:pr|pull request)|"
@@ -168,7 +171,7 @@ def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
         return Intent.JOB_STATUS
     if _CANCEL_PATTERN.search(normalized):
         return Intent.CANCEL
-    if _AWS_PATTERN.search(normalized):
+    if _AWS_PATTERN.search(normalized) or _AWS_DISCOVERY_PATTERN.search(normalized):
         return Intent.AWS_REPORT
     if _PR_PATTERN.search(normalized):
         return Intent.PULL_REQUEST
@@ -186,12 +189,52 @@ def explicitly_requests_code_change(message: str) -> bool:
     return bool(_CODE_CHANGE_PATTERN.search(_phrase_normalize(message)))
 
 
+def parse_aws_query(message: str) -> tuple[str, str | None] | None:
+    """Translate a narrow natural-language request into a fixed host operation."""
+    normalized = _phrase_normalize(message)
+    prefix = r"(?:por favor )?(?:lista|listar|muestra|consulta) (?:las )?"
+    if re.fullmatch(prefix + r"tablas (?:de |en )?(?:dynamodb|dynamo db)(?: en aws)?", normalized):
+        return "list-dynamodb", None
+    if re.fullmatch(r"(?:por favor )?(?:lista|listar|muestra|consulta) (?:los )?grupos (?:de |en )?cloudwatch(?: logs)?", normalized):
+        return "list-log-groups", None
+    scan = re.fullmatch(
+        r"\s*(?:por favor\s+)?(?:consulta|muestra|ver|lee)\s+(?:los\s+)?registros\s+de\s+la\s+tabla\s+"
+        r"[`'\"]?([A-Za-z0-9_.-]{3,255})[`'\"]?\s+(?:en\s+|de\s+)?DynamoDB[.!?]?\s*",
+        message, re.IGNORECASE,
+    )
+    if scan:
+        return "scan-dynamodb", scan.group(1)
+    logs = re.fullmatch(
+        r"\s*(?:por favor\s+)?(?:ver|muestra|consulta|lee)\s+(?:los\s+)?logs\s+(?:del\s+|de\s+)?grupo\s+"
+        r"[`'\"]?([A-Za-z0-9._/#-]{1,512})[`'\"]?\s+en\s+CloudWatch(?:\s+Logs)?[.!?]?\s*",
+        message, re.IGNORECASE,
+    )
+    if logs:
+        return "read-logs", logs.group(1)
+    table = re.fullmatch(
+        r"\s*(?:por favor\s+)?describe\s+(?:la\s+)?tabla\s+[`'\"]?"
+        r"([A-Za-z0-9_.-]{3,255})[`'\"]?\s+(?:en\s+|de\s+)?DynamoDB(?:\s+en\s+AWS)?[.!?]?\s*",
+        message, re.IGNORECASE,
+    )
+    if table:
+        return "describe-dynamodb", table.group(1)
+    table = re.fullmatch(
+        r"\s*(?:por favor\s+)?describe\s+(?:la\s+)?tabla\s+(?:de\s+)?DynamoDB\s+"
+        r"[`'\"]?([A-Za-z0-9_.-]{3,255})[`'\"]?(?:\s+en\s+AWS)?[!?]?\s*",
+        message, re.IGNORECASE,
+    )
+    if table:
+        return "describe-dynamodb", table.group(1)
+    return None
+
+
 def route_message(
     message: str,
     *,
     active_repository: str | None = None,
     active_job_id: str | None = None,
     repositories: Iterable[str] = (),
+    aws_enabled: bool = False,
 ) -> RouteDecision:
     """Return a transport-neutral deterministic route for one owner message."""
     intent = classify_intent(
@@ -207,7 +250,7 @@ def route_message(
         repository, _ = resolve_execution_repository(message, active_repository, repositories)
         return RouteDecision(intent, Backend.OPENCODE, repository=repository)
     if intent is Intent.AWS_REPORT:
-        return RouteDecision(intent, Backend.NONE, reason=AWS_DISABLED)
+        return RouteDecision(intent, Backend.WORKER if aws_enabled else Backend.NONE, reason=None if aws_enabled else AWS_DISABLED)
     if intent in {Intent.FORGET, Intent.CAPABILITIES}:
         return RouteDecision(intent, Backend.STORAGE)
     if intent in {Intent.JOB_STATUS, Intent.CANCEL}:

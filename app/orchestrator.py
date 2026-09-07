@@ -39,6 +39,7 @@ from .router import (
     AMBIGUOUS_REPOSITORY,
     REPOSITORY_REQUIRED,
     explicitly_requests_code_change,
+    parse_aws_query,
     route_message,
 )
 from .scheduler import JobOutcome, PersistentScheduler
@@ -47,8 +48,17 @@ from .worker_client import WorkerNotFoundError
 
 
 AWS_DISABLED_MESSAGE = (
-    "La integración con AWS y DynamoDB está pospuesta en esta fase. "
-    "El bot principal funciona sin credenciales AWS."
+    "Las consultas AWS están desactivadas. El bot principal no recibe credenciales AWS."
+)
+AWS_QUERY_HELP = (
+    "Puedo consultar DynamoDB y CloudWatch desde el host. Operaciones disponibles:\n"
+    "- lista tablas de DynamoDB\n"
+    "- describe la tabla NOMBRE en DynamoDB\n"
+    "- consulta registros de la tabla NOMBRE en DynamoDB\n"
+    "- lista grupos de CloudWatch\n"
+    "- ver logs del grupo /NOMBRE en CloudWatch\n"
+    "Listados: hasta 25 recursos. Datos: una página de hasta 10 registros o 20 eventos de la última hora. "
+    "Estas operaciones solo leen; las modificaciones necesitan una solicitud explícita y un flujo separado."
 )
 REPOSITORY_REQUIRED_MESSAGE = (
     "Necesito que indiques un único repositorio para preparar ese cambio."
@@ -84,6 +94,8 @@ class OpenCodeLike(Protocol):
 
 
 class WorkerLike(Protocol):
+    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None) -> Mapping[str, object]: ...
+
     async def create_codex_job(self, **kwargs: object) -> Mapping[str, object]: ...
 
     async def get_job(self, job_id: str) -> Mapping[str, object]: ...
@@ -135,6 +147,7 @@ class PooIAOrchestrator:
         worker: WorkerLike | None = None,
         repositories: Iterable[str] = (),
         worker_poll_seconds: float = 2.0,
+        aws_enabled: bool = False,
         clock: Callable[[], float] = time.time,
     ) -> None:
         if worker_poll_seconds <= 0:
@@ -145,6 +158,7 @@ class PooIAOrchestrator:
         self.ollama = ollama
         self.opencode = opencode
         self.worker = worker
+        self.aws_enabled = aws_enabled
         self.repositories = tuple(
             dict.fromkeys(repository.strip() for repository in repositories if repository.strip())
         )
@@ -340,6 +354,7 @@ class PooIAOrchestrator:
                 active_repository=snapshot.conversation.active_repository,
                 active_job_id=snapshot.conversation.last_job_id,
                 repositories=self.repositories,
+                aws_enabled=self.aws_enabled,
             )
 
             active_repository = decision.repository
@@ -382,6 +397,7 @@ class PooIAOrchestrator:
                         active_repository=snapshot.conversation.active_repository,
                         active_job_id=None,
                         repositories=self.repositories,
+                        aws_enabled=self.aws_enabled,
                     )
                     active_repository = fresh.repository
                     if active_repository is not None:
@@ -490,6 +506,7 @@ class PooIAOrchestrator:
                 active_repository=snapshot.conversation.active_repository,
                 active_job_id=snapshot.conversation.last_job_id,
                 repositories=self.repositories,
+                aws_enabled=self.aws_enabled,
             )
             try:
                 await self._process_registered_direct(
@@ -548,9 +565,7 @@ class PooIAOrchestrator:
             text = await self._cancel_text(self._resolve_job(decision.job_id))
             self._enqueue_direct(request.request_id, text, remember=False)
         elif intent is Intent.AWS_REPORT:
-            self._enqueue_direct(
-                request.request_id, AWS_DISABLED_MESSAGE, remember=False
-            )
+            await self._handle_aws_query(request.request_id, message.text)
         elif intent is Intent.CLARIFY:
             text = {
                 AMBIGUOUS_REPOSITORY: AMBIGUOUS_REPOSITORY_MESSAGE,
@@ -586,7 +601,39 @@ class PooIAOrchestrator:
                 if self.worker is not None
                 else "Puedo consultar la documentación del brain, pero el worker de cambios no está configurado."
             )
+            if self.aws_enabled and self.worker is not None:
+                text += (
+                    " También puedo consultar DynamoDB y CloudWatch: tablas, registros y logs acotados. "
+                    "Estas consultas son de solo lectura desde el host."
+                )
             self._enqueue_direct(request.request_id, text, remember=False)
+
+    async def _handle_aws_query(self, request_id: str, message: str) -> None:
+        if not self.aws_enabled:
+            self._enqueue_direct(request_id, AWS_DISABLED_MESSAGE, remember=False)
+            return
+        query = parse_aws_query(message)
+        if query is None:
+            self._enqueue_direct(request_id, AWS_QUERY_HELP, remember=False)
+            return
+        if self.worker is None:
+            self._enqueue_direct(request_id, "El worker de consultas AWS no está disponible.", remember=False)
+            return
+        action, resource = query
+        try:
+            report = await self.worker.query_aws(
+                action,
+                table=resource if action in {"describe-dynamodb", "scan-dynamodb"} else None,
+                log_group=resource if action == "read-logs" else None,
+            )
+            text = str(report["message"])
+            if report.get("state") != "succeeded":
+                self.storage.update_request_status(request_id, RequestStatus.FAILED)
+        except Exception:
+            # The public transport error must not echo HTTP/CLI diagnostics.
+            text = "No pude completar la consulta AWS mediante el worker del host."
+            self.storage.update_request_status(request_id, RequestStatus.FAILED)
+        self._enqueue_direct(request_id, text, backend=Backend.WORKER, remember=False)
 
     async def record_processing_failure(
         self,

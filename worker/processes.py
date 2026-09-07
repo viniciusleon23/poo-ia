@@ -10,7 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Mapping, Protocol, Sequence
 
 
 DEFAULT_CAPTURE_LIMIT_BYTES = 1_000_000
@@ -59,6 +59,7 @@ class SubprocessCommandRunner:
         *,
         capture_limit_bytes: int = DEFAULT_CAPTURE_LIMIT_BYTES,
         termination_grace_seconds: float = DEFAULT_TERMINATION_GRACE_SECONDS,
+        environment: Mapping[str, str] | None = None,
     ) -> None:
         if capture_limit_bytes <= 0:
             raise ValueError("capture_limit_bytes must be positive")
@@ -66,6 +67,7 @@ class SubprocessCommandRunner:
             raise ValueError("termination_grace_seconds must be positive")
         self.capture_limit_bytes = capture_limit_bytes
         self.termination_grace_seconds = termination_grace_seconds
+        self.environment = None if environment is None else dict(environment)
 
     def run(
         self,
@@ -86,7 +88,7 @@ class SubprocessCommandRunner:
         if limit <= 0:
             raise ValueError("capture_limit_bytes must be positive")
 
-        environment = os.environ.copy()
+        environment = os.environ.copy() if self.environment is None else dict(self.environment)
         environment.pop("WORKER_PASSWORD", None)
         process = subprocess.Popen(
             [str(part) for part in argv],

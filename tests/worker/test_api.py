@@ -137,6 +137,35 @@ class WorkerApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_business_query_rejects_unstructured_payloads_and_resource_overrides(self) -> None:
+        enabled = replace(self.settings, aws_enabled=True,
+                          aws_tasks_table="Tasks", aws_dealer_config_table="DealerConfig")
+        runner = FakeRunner(CommandResult(0, "{}"))
+        client = TestClient(TestServer(create_app(
+            enabled, manager=FakeManager(), aws_queries=AwsQueries(enabled, runner=runner),
+        )))
+        await client.start_server()
+        query = {"dealer_id": "COMAZDCALC2", "day": "tomorrow", "requested_at": 1_788_740_000.0}
+        try:
+            unauthenticated = await client.post("/v1/aws/query", json={
+                "action": "count-planned-tasks", "business_query": query,
+            })
+            self.assertEqual(unauthenticated.status, 401)
+            for payload in (
+                {"action": "count-planned-tasks", "business_query": "count everything"},
+                {"action": "count-planned-tasks", "business_query": None},
+                {"action": "count-planned-tasks", "business_query": query, "table": "Other"},
+                {"action": "count-planned-tasks", "business_query": query, "log_group": "/other"},
+                {"action": "count-planned-tasks", "business_query": query | {"command": "delete-table"}},
+                {"action": "list-dynamodb", "business_query": query},
+            ):
+                with self.subTest(payload=payload):
+                    response = await client.post("/v1/aws/query", headers=self.auth_headers, json=payload)
+                    self.assertEqual(response.status, 400)
+            self.assertEqual(runner.calls, [])
+        finally:
+            await client.close()
+
     async def test_aws_csv_format_returns_bounded_attachment_and_rejects_unknown_format(self) -> None:
         import base64
         import hashlib

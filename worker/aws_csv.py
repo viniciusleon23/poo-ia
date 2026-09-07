@@ -19,11 +19,12 @@ from decimal import Decimal, InvalidOperation
 
 MAX_CSV_BYTES = 128 * 1024
 _MISSING = object()
-_LIMITS = {"list-dynamodb": 25, "describe-dynamodb": 1, "scan-dynamodb": 10, "list-log-groups": 25, "read-logs": 20}
+_LIMITS = {"list-dynamodb": 25, "describe-dynamodb": 1, "scan-dynamodb": 10, "list-log-groups": 25, "read-logs": 20, "count-planned-tasks": 1}
 _FILENAMES = {
     "list-dynamodb": "dynamodb-tablas.csv", "describe-dynamodb": "dynamodb-detalle.csv",
     "scan-dynamodb": "dynamodb-registros.csv", "list-log-groups": "cloudwatch-grupos.csv",
     "read-logs": "cloudwatch-logs.csv",
+    "count-planned-tasks": "tareas-planeadas.csv",
 }
 
 
@@ -83,6 +84,13 @@ def _check_size(stream: io.StringIO) -> None:
 
 
 def _rows(action: str, payload: dict[str, object], limit: int) -> tuple[list[str], list[dict[str, object]], bool]:
+    if action == "count-planned-tasks":
+        record = payload["Summary"]
+        headers = ["dealer_id", "date", "time_zone", "count", "source"]
+        if not isinstance(record, dict) or set(record) != set(headers) or record["count"] is None:
+            raise CsvExportError("El resumen de tareas no tiene un formato válido.")
+        row = {key: _number(record[key]) if key == "count" else _string(record[key]) for key in headers}
+        return headers, [row], False
     if action == "describe-dynamodb":
         record = payload["Table"]
         if not isinstance(record, dict):

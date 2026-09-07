@@ -94,6 +94,21 @@ class WorkerSettingsTests(unittest.TestCase):
         self.assertEqual(settings.operational_retention_days, 45)
         self.assertEqual(settings.retention_sweep_seconds, 7200)
 
+    def test_business_tables_are_explicit_host_configuration(self) -> None:
+        defaults = WorkerSettings.from_environment(self.base_environment())
+        self.assertIsNone(defaults.aws_tasks_table)
+        self.assertIsNone(defaults.aws_dealer_config_table)
+        settings = WorkerSettings.from_environment(self.base_environment() | {
+            "AWS_TASKS_TABLE": "tasks-v2-prod",
+            "AWS_DEALER_CONFIG_TABLE": "dealer-config-prod",
+        })
+        self.assertEqual(settings.aws_tasks_table, "tasks-v2-prod")
+        self.assertEqual(settings.aws_dealer_config_table, "dealer-config-prod")
+        for name in ("AWS_TASKS_TABLE", "AWS_DEALER_CONFIG_TABLE"):
+            for invalid in ("file:///private", "Tasks; whoami", "x" * 256):
+                with self.subTest(name=name, invalid=invalid), self.assertRaises(WorkerConfigurationError):
+                    WorkerSettings.from_environment(self.base_environment() | {name: invalid})
+
     def test_rejects_invalid_retention_and_overlapping_resolved_roots(self) -> None:
         with self.assertRaisesRegex(WorkerConfigurationError, "positive"):
             WorkerSettings.from_environment(

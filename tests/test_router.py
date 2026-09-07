@@ -93,6 +93,32 @@ class RouterTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(choose_backend(message), Backend.OPENCODE)
 
+    def test_social_messages_never_reach_the_paid_research_backend(self) -> None:
+        for message in (
+            "hola, ¿cómo estás?",
+            "buenas, ¿todo bien?",
+            "hola qué tal, ¿sigues por ahí?",
+            "gracias crack",
+            "ok",
+            "listo",
+            "va que va",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(message)
+                self.assertEqual(decision.intent, Intent.CHAT)
+                self.assertEqual(decision.backend, Backend.OLLAMA)
+
+    def test_bare_dynamo_vocabulary_still_routes_to_aws_reads(self) -> None:
+        for message in (
+            "qué tablas hay en dynamo",
+            "consulta la tabla Users en dynamo",
+            "dame los registros de la tabla Users en ddb",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(message, aws_enabled=True)
+                self.assertEqual(decision.intent, Intent.AWS_REPORT)
+                self.assertEqual(decision.backend, Backend.WORKER)
+
     def test_classifies_all_deterministic_control_intents(self) -> None:
         cases = {
             "olvida la conversación": Intent.FORGET,

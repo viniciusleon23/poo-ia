@@ -64,7 +64,32 @@ STATUS_PHRASES = frozenset(
     }
 )
 
-_AWS_PATTERN = re.compile(r"\b(?:aws|dynamo\s*db|dynamodb|cloud\s*watch|sts|amazon web services)\b")
+# Research reaches a paid backend, so it requires a positive signal rather than
+# being the fall-through. Anything without one is social chatter and stays on
+# the free local model.
+_RESEARCH_VERB = re.compile(
+    r"\b(?:analiza|analizar|averigua|averiguar|busca|buscar|compara|comparar|"
+    r"describe|describir|diagnostica|diagnosticar|documenta|documentar|"
+    r"explica|explicas|explicame|explicar|explicarme|investiga|investigar|"
+    r"lee|leer|resume|resumir|revisa|revisar|valida|validar|verifica|verificar)\b"
+)
+_RESEARCH_QUESTION = re.compile(
+    r"\b(?:que (?:es|son|hace|hacen|significa|implica|contiene|devuelve|retorna|crea)|"
+    r"para que sirve|por que|como funciona|donde esta|donde se)\b"
+)
+_TECHNICAL_TOPIC = re.compile(
+    r"\b(?:api|archivo|archivos|bot|branch|bug|campo|clase|codigo|commit|"
+    r"dependencia|dependencias|deploy|endpoint|endpoints|error|errores|esquema|"
+    r"falla|fallo|flujo|funcion|job|lambda|lambdas|log|logs|metodo|migracion|"
+    r"modelo|modulo|parametro|pipeline|pr|proceso|pull request|pydantic|queue|"
+    r"registro|registros|repo|repositorio|scheduler|schema|servicio|servicios|"
+    r"tabla|tablas|tarea|tareas|test|tests|trabajo|variable|worker)\b"
+)
+
+
+_AWS_PATTERN = re.compile(
+    r"\b(?:aws|dynamo(?:\s*db)?|ddb|cloud\s*watch|sts|amazon web services)\b"
+)
 _AWS_DISCOVERY_PATTERN = re.compile(
     r"\b(?:lista|listar|muestra|consulta|que|cuantas)\b.*\b(?:lambdas|funciones lambda)\b"
 )
@@ -187,7 +212,7 @@ def _extract_job_id(message: str, active_job_id: str | None) -> str | None:
 
 
 def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
-    """Classify explicit controls/mutations and default technical text to research."""
+    """Classify explicit controls/mutations; research needs a positive signal."""
     normalized = _phrase_normalize(message)
     if normalized in FORGET_PHRASES:
         return Intent.FORGET
@@ -210,7 +235,19 @@ def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
         return Intent.CODE_CHANGE
     if normalized in SMALL_TALK:
         return Intent.CHAT
-    return Intent.RESEARCH
+    if requests_research(message):
+        return Intent.RESEARCH
+    return Intent.CHAT
+
+
+def requests_research(message: str) -> bool:
+    """Report whether a message actually asks for a read-only investigation."""
+    normalized = _phrase_normalize(message)
+    return bool(
+        _RESEARCH_VERB.search(normalized)
+        or _RESEARCH_QUESTION.search(normalized)
+        or _TECHNICAL_TOPIC.search(normalized)
+    )
 
 
 def explicitly_requests_code_change(message: str) -> bool:

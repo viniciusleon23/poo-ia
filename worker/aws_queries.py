@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import WorkerSettings
+from .aws_csv import CsvExportError, CsvTooLargeError, build_csv_attachment
 from .processes import CommandRunner, CommandTimedOut, SubprocessCommandRunner
 
 
@@ -23,6 +24,7 @@ MAX_ITEMS = 25
 MAX_RECORDS = 10
 MAX_EVENTS = 20
 MAX_CAPTURE_BYTES = 65_536
+MAX_CSV_CAPTURE_BYTES = 1_048_576
 _TABLE_NAME = re.compile(r"[A-Za-z0-9_.-]{3,255}\Z")
 _LOG_GROUP = re.compile(r"[A-Za-z0-9._/#-]{1,512}\Z")
 _OPERATIONS = {
@@ -56,7 +58,9 @@ class AwsQueries:
         self.runner = runner or SubprocessCommandRunner(environment=_aws_environment())
         self.clock = clock
 
-    def query(self, action: str, *, table: str | None = None, log_group: str | None = None) -> dict[str, object]:
+    def query(self, action: str, *, table: str | None = None, log_group: str | None = None, output_format: str = "text") -> dict[str, object]:
+        if not isinstance(output_format, str) or output_format not in {"text", "csv"}:
+            raise ValueError("El formato AWS debe ser text o csv.")
         if not self.settings.aws_enabled:
             return _failure("disabled", "Las consultas AWS están desactivadas en el worker.", state="disabled")
         if not isinstance(action, str) or action not in _OPERATIONS:
@@ -104,7 +108,7 @@ class AwsQueries:
         try:
             result = self.runner.run(
                 tuple(argv), timeout=self.settings.aws_query_timeout_seconds,
-                capture_limit_bytes=MAX_CAPTURE_BYTES,
+                capture_limit_bytes=MAX_CSV_CAPTURE_BYTES if output_format == "csv" else MAX_CAPTURE_BYTES,
             )
         except CommandTimedOut:
             return _failure("timeout", "AWS no respondió dentro del límite de tiempo de la consulta.")
@@ -120,7 +124,13 @@ class AwsQueries:
             payload = json.loads(result.stdout)
             if not isinstance(payload, dict):
                 raise ValueError
+            if output_format == "csv":
+                return self._csv_report(action, payload, table=table, log_group=log_group)
             message, truncated = self._render(action, payload, table=table, log_group=log_group)
+        except CsvTooLargeError as error:
+            return _failure("csv-too-large", str(error))
+        except CsvExportError as error:
+            return _failure("csv-invalid", str(error))
         except (ValueError, TypeError, KeyError, RecursionError):
             return _failure("invalid-output", "AWS devolvió una respuesta que no cumple el formato esperado.")
         return {
@@ -129,6 +139,31 @@ class AwsQueries:
                 MAX_ITEMS if action.startswith("list-") else MAX_RECORDS if action == "scan-dynamodb"
                 else MAX_EVENTS if action == "read-logs" else 1
             ),
+        }
+
+    def _csv_report(self, action: str, payload: dict[str, object], *, table: str | None, log_group: str | None) -> dict[str, object]:
+        limit = MAX_ITEMS if action.startswith("list-") else MAX_RECORDS if action == "scan-dynamodb" else MAX_EVENTS if action == "read-logs" else 1
+        export = build_csv_attachment(action, payload, row_limit=limit, redact=_redact_record)
+        region = _identifier(self.settings.aws_region)
+        subject = {
+            "list-dynamodb": "Tablas DynamoDB", "describe-dynamodb": "Detalle DynamoDB",
+            "scan-dynamodb": "Registros DynamoDB", "list-log-groups": "Grupos CloudWatch",
+            "read-logs": "Logs CloudWatch",
+        }[action]
+        resource = f" de {_identifier(table or log_group)}" if table or log_group else ""
+        lines = [f"CSV de {subject}{resource} en {region}: {export.row_count} filas (límite: {limit})."]
+        if action == "scan-dynamodb":
+            lines.append("Una página de hasta 10 registros evaluados, con consistencia eventual; no es una exportación de toda la tabla.")
+        elif action == "read-logs":
+            lines.append("Una página de hasta 20 eventos de la última hora, más recientes primero; no es el historial completo.")
+        if export.partial:
+            lines.append("Resultado parcial: AWS indica más páginas o se alcanzó el límite de filas.")
+        elif action.startswith("list-"):
+            lines.append("AWS no indicó más páginas en esta respuesta.")
+        lines.append("CSV UTF-8 para Excel, sin recorte de celdas y con límite total de 128 KiB. Se protegen fórmulas y patrones comunes de credenciales; la redacción puede no reconocer todos los datos sensibles.")
+        return {
+            "state": "succeeded", "action": action, "message": "\n".join(lines),
+            "truncated": export.partial, "limit": limit, "attachment": export.attachment,
         }
 
     @staticmethod

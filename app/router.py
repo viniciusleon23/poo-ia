@@ -64,6 +64,28 @@ _AWS_PATTERN = re.compile(r"\b(?:aws|dynamo\s*db|dynamodb|cloud\s*watch|sts|amaz
 _AWS_DISCOVERY_PATTERN = re.compile(
     r"\b(?:lista|listar|muestra|consulta|que|cuantas)\b.*\b(?:lambdas|funciones lambda)\b"
 )
+_CSV_SUFFIX = re.compile(
+    r"\s+(?:(?:y\s+)?(?:d[aá]melo|devu[eé]lvemelo|regr[eé]samelo|exp[oó]rtalo)\s+)?"
+    r"en\s+(?:formato\s+)?csv(?:\s+por\s+favor)?[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_AWS_CSV_FOLLOWUPS = frozenset({
+    "en csv", "en formato csv", "damelo en csv", "devuelvemelo en csv",
+    "regresamelo en csv", "exportalo en csv", "exporta la consulta en csv",
+    "exporta la consulta anterior en csv", "me puedes regresar un csv",
+    "y me puede regresar un csv", "puedes darme un csv",
+})
+
+
+def is_aws_csv_followup(message: str) -> bool:
+    """Only explicit export follow-ups may reuse a prior AWS read request."""
+    phrase = _phrase_normalize(message)
+    phrase = re.sub(r"^por favor | por favor$", "", phrase)
+    return phrase in _AWS_CSV_FOLLOWUPS
+
+
+def aws_csv_requested(message: str) -> bool:
+    return is_aws_csv_followup(message) or bool(_CSV_SUFFIX.search(message))
 _PR_PATTERN = re.compile(
     r"^(?:por favor\s+)?(?:"
     r"(?:arma|abre|crea|publica|sube|haz)\s+(?:el\s+|un\s+)?(?:pr|pull request)|"
@@ -171,7 +193,8 @@ def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
         return Intent.JOB_STATUS
     if _CANCEL_PATTERN.search(normalized):
         return Intent.CANCEL
-    if _AWS_PATTERN.search(normalized) or _AWS_DISCOVERY_PATTERN.search(normalized):
+    if (_AWS_PATTERN.search(normalized) or _AWS_DISCOVERY_PATTERN.search(normalized)
+            or is_aws_csv_followup(message)):
         return Intent.AWS_REPORT
     if _PR_PATTERN.search(normalized):
         return Intent.PULL_REQUEST
@@ -191,6 +214,7 @@ def explicitly_requests_code_change(message: str) -> bool:
 
 def parse_aws_query(message: str) -> tuple[str, str | None] | None:
     """Translate a narrow natural-language request into a fixed host operation."""
+    message = _CSV_SUFFIX.sub("", message)
     normalized = _phrase_normalize(message)
     prefix = r"(?:por favor )?(?:lista|listar|muestra|consulta) (?:las )?"
     if re.fullmatch(prefix + r"tablas (?:de |en )?(?:dynamodb|dynamo db)(?: en aws)?", normalized):

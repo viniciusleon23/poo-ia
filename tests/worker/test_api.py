@@ -137,6 +137,30 @@ class WorkerApiTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.close()
 
+    async def test_aws_csv_format_returns_bounded_attachment_and_rejects_unknown_format(self) -> None:
+        import base64
+        import hashlib
+        enabled = replace(self.settings, aws_enabled=True)
+        runner = FakeRunner(CommandResult(0, json.dumps({"TableNames": ["Tasks"]})))
+        client = TestClient(TestServer(create_app(
+            enabled, manager=FakeManager(), aws_queries=AwsQueries(enabled, runner=runner)
+        )))
+        await client.start_server()
+        try:
+            invalid = await client.post("/v1/aws/query", headers=self.auth_headers, json={"action": "list-dynamodb", "format": "xlsx"})
+            self.assertEqual(invalid.status, 400)
+            self.assertEqual(runner.calls, [])
+            response = await client.post("/v1/aws/query", headers=self.auth_headers, json={"action": "list-dynamodb", "format": "csv"})
+            result = (await response.json())["result"]
+            self.assertEqual(response.status, 200)
+            attachment = result["attachment"]
+            content = base64.b64decode(attachment["content_base64"], validate=True)
+            self.assertEqual(content.decode("utf-8-sig"), "table_name\r\nTasks\r\n")
+            self.assertEqual(attachment["sha256"], hashlib.sha256(content).hexdigest())
+            self.assertEqual(len(runner.calls), 1)
+        finally:
+            await client.close()
+
     async def test_create_get_cancel_and_idempotent_retry(self) -> None:
         payload = {
             "job_id": "discord-1001",

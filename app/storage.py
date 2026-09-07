@@ -24,6 +24,7 @@ from .models import (
     Backend,
     Conversation,
     ConversationKey,
+    CsvAttachment,
     Exchange,
     InboundMessage,
     InboundRegistration,
@@ -59,6 +60,10 @@ class InvalidJobTransition(StorageError):
 
 _UNSET = object()
 _CHECKPOINT_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_ATTACHMENT_COLUMNS = (
+    "a.filename AS attachment_filename, a.content_type AS attachment_content_type, "
+    "a.data AS attachment_data, a.sha256 AS attachment_sha256"
+)
 
 _ALLOWED_JOB_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.QUEUED: frozenset({JobStatus.RUNNING, JobStatus.CANCELLED}),
@@ -663,6 +668,48 @@ class SQLiteStorage:
             ).fetchone()
         return None if row is None else self._request_from_row(row)
 
+    def recent_aws_query_requests(
+        self, key: ConversationKey, *, exclude_request_id: str, limit: int = 10
+    ) -> list[InboundRequest]:
+        """Read completed operational AWS requests without using model memory.
+
+        Callers may inspect the bounded list to skip shorthand follow-ups. Failed
+        requests, help responses, other users, requests before forget, and requests
+        after the current request are excluded, so recovery selects the same history.
+        """
+        if not 1 <= limit <= 100:
+            raise ValueError("AWS request history limit must be between 1 and 100")
+        source, channel_id, user_id = self._key_values(key)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT r.* FROM inbound_requests AS r
+                JOIN conversations AS c ON c.id = r.conversation_id
+                JOIN inbound_requests AS current ON current.request_id = ?
+                  AND current.conversation_id = c.id
+                  AND current.memory_generation = c.memory_generation
+                WHERE c.source = ? AND c.channel_id = ? AND c.user_id = ?
+                  AND r.memory_generation = c.memory_generation
+                  AND (r.created_at < current.created_at
+                       OR (r.created_at = current.created_at AND r.rowid < current.rowid))
+                  AND r.intent = ? AND r.status = ?
+                  AND EXISTS (
+                      SELECT 1 FROM outbox AS o WHERE o.request_id = r.request_id
+                      AND o.backend = ? AND o.kind = 'response'
+                  )
+                ORDER BY r.created_at DESC, r.rowid DESC LIMIT ?
+                """,
+                (exclude_request_id, source, channel_id, user_id, Intent.AWS_REPORT.value,
+                 RequestStatus.COMPLETED.value, Backend.WORKER.value, limit),
+            ).fetchall()
+        return [self._request_from_row(row) for row in rows]
+
+    def latest_aws_query_request(
+        self, key: ConversationKey, *, exclude_request_id: str
+    ) -> InboundRequest | None:
+        requests = self.recent_aws_query_requests(key, exclude_request_id=exclude_request_id, limit=1)
+        return requests[0] if requests else None
+
     def list_recoverable_direct_messages(
         self, *, limit: int | None = None
     ) -> list[InboundMessage]:
@@ -1101,6 +1148,7 @@ class SQLiteStorage:
         parts: Sequence[str],
         backend: Backend | str | None,
         exchange_on_complete: bool,
+        attachment: CsvAttachment | None = None,
         now: float | None = None,
     ) -> OutboxMessage:
         if not kind.strip() or not dedupe_key.strip():
@@ -1109,6 +1157,12 @@ class SQLiteStorage:
             raise ValueError("assistant_text must not be empty")
         if not parts or any(not isinstance(part, str) or not part for part in parts):
             raise ValueError("outbox parts must contain at least one non-empty string")
+        if attachment is not None and not isinstance(attachment, CsvAttachment):
+            raise ValueError("outbox attachment must be a CsvAttachment")
+        if attachment is not None:
+            # Exports and their potentially sensitive operational text never
+            # become conversational context, even if a caller forgets the flag.
+            exchange_on_complete = False
         timestamp = self._now(now)
         outbox_id = deterministic_outbox_id(request_id, kind, dedupe_key)
         backend_value = _enum_value(backend)
@@ -1121,6 +1175,7 @@ class SQLiteStorage:
                 (request_id, kind, dedupe_key),
             ).fetchone()
             if existing is not None:
+                existing_attachment = self._attachment_for_outbox(connection, existing["outbox_id"])
                 existing_parts = [
                     row[0]
                     for row in connection.execute(
@@ -1136,11 +1191,12 @@ class SQLiteStorage:
                     or existing["backend"] != backend_value
                     or bool(existing["exchange_on_complete"]) != exchange_on_complete
                     or existing_parts != list(parts)
+                    or existing_attachment != attachment
                 ):
                     raise StorageConflictError(
                         "outbox idempotency key was reused with different content"
                     )
-                return self._outbox_from_row(existing)
+                return self._outbox_from_row(existing, attachment=existing_attachment)
 
             request = connection.execute(
                 "SELECT * FROM inbound_requests WHERE request_id = ?", (request_id,)
@@ -1181,18 +1237,28 @@ class SQLiteStorage:
                     for index, content in enumerate(parts)
                 ],
             )
+            if attachment is not None:
+                connection.execute(
+                    """
+                    INSERT INTO outbox_attachments(outbox_id, filename, content_type, data, sha256)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (outbox_id, attachment.filename, attachment.content_type,
+                     attachment.data, attachment.sha256),
+                )
             row = connection.execute(
                 "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
             ).fetchone()
         assert row is not None
-        return self._outbox_from_row(row)
+        return self._outbox_from_row(row, attachment=attachment)
 
     def get_outbox(self, outbox_id: str) -> OutboxMessage | None:
         with self._lock:
             row = self._connection.execute(
                 "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
             ).fetchone()
-        return None if row is None else self._outbox_from_row(row)
+            attachment = self._attachment_for_outbox(self._connection, outbox_id) if row is not None else None
+        return None if row is None else self._outbox_from_row(row, attachment=attachment)
 
     def request_has_outbox(self, request_id: str) -> bool:
         """Return whether any durable output already owns this request."""
@@ -1205,11 +1271,12 @@ class SQLiteStorage:
     def list_outbox_parts(self, outbox_id: str) -> list[OutboxPart]:
         with self._lock:
             rows = self._connection.execute(
-                """
-                SELECT p.*, c.channel_id, c.user_id
+                f"""
+                SELECT p.*, c.channel_id, c.user_id, {_ATTACHMENT_COLUMNS}
                 FROM outbox_parts AS p
                 JOIN outbox AS o ON o.outbox_id = p.outbox_id
                 JOIN conversations AS c ON c.id = o.conversation_id
+                LEFT JOIN outbox_attachments AS a ON a.outbox_id = o.outbox_id AND p.part_index = 0
                 WHERE p.outbox_id = ?
                 ORDER BY p.part_index
                 """,
@@ -1229,10 +1296,11 @@ class SQLiteStorage:
         with self._lock:
             rows = self._connection.execute(
                 f"""
-                SELECT p.*, c.channel_id, c.user_id
+                SELECT p.*, c.channel_id, c.user_id, {_ATTACHMENT_COLUMNS}
                 FROM outbox_parts AS p
                 JOIN outbox AS o ON o.outbox_id = p.outbox_id
                 JOIN conversations AS c ON c.id = o.conversation_id
+                LEFT JOIN outbox_attachments AS a ON a.outbox_id = o.outbox_id AND p.part_index = 0
                 WHERE {where}
                 ORDER BY o.created_at, o.id, p.part_index
                 """,
@@ -1335,11 +1403,12 @@ class SQLiteStorage:
                     )
 
             updated = connection.execute(
-                """
-                SELECT p.*, c.channel_id, c.user_id
+                f"""
+                SELECT p.*, c.channel_id, c.user_id, {_ATTACHMENT_COLUMNS}
                 FROM outbox_parts AS p
                 JOIN outbox AS o ON o.outbox_id = p.outbox_id
                 JOIN conversations AS c ON c.id = o.conversation_id
+                LEFT JOIN outbox_attachments AS a ON a.outbox_id = o.outbox_id AND p.part_index = 0
                 WHERE p.outbox_id = ? AND p.part_index = ?
                 """,
                 (outbox_id, part_index),
@@ -1525,7 +1594,7 @@ class SQLiteStorage:
         )
 
     @staticmethod
-    def _outbox_from_row(row: sqlite3.Row) -> OutboxMessage:
+    def _outbox_from_row(row: sqlite3.Row, *, attachment: CsvAttachment | None = None) -> OutboxMessage:
         return OutboxMessage(
             outbox_id=row["outbox_id"],
             conversation_id=int(row["conversation_id"]),
@@ -1538,6 +1607,7 @@ class SQLiteStorage:
             completed_at=(
                 None if row["completed_at"] is None else float(row["completed_at"])
             ),
+            attachment=attachment,
         )
 
     @staticmethod
@@ -1551,4 +1621,28 @@ class SQLiteStorage:
             discord_message_id=row["discord_message_id"],
             acked_at=None if row["acked_at"] is None else float(row["acked_at"]),
             created_at=float(row["created_at"]),
+            attachment=SQLiteStorage._attachment_from_row(row),
         )
+
+    @staticmethod
+    def _attachment_for_outbox(connection: sqlite3.Connection, outbox_id: str) -> CsvAttachment | None:
+        row = connection.execute(
+            f"SELECT {_ATTACHMENT_COLUMNS} FROM outbox_attachments AS a WHERE a.outbox_id = ?",
+            (outbox_id,),
+        ).fetchone()
+        return None if row is None else SQLiteStorage._attachment_from_row(row)
+
+    @staticmethod
+    def _attachment_from_row(row: sqlite3.Row) -> CsvAttachment | None:
+        if row["attachment_filename"] is None:
+            return None
+        try:
+            attachment = CsvAttachment(
+                filename=row["attachment_filename"], data=row["attachment_data"],
+                content_type=row["attachment_content_type"],
+            )
+        except (TypeError, ValueError) as error:
+            raise StorageError("Stored CSV attachment is invalid") from error
+        if attachment.sha256 != row["attachment_sha256"]:
+            raise StorageError("Stored CSV attachment failed its integrity check")
+        return attachment

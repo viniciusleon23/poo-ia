@@ -11,6 +11,7 @@ from unittest.mock import patch
 from app.memory import MemoryStore
 from app.models import (
     ConversationKey,
+    CsvAttachment,
     InboundMessage,
     Intent,
     JobKind,
@@ -104,6 +105,7 @@ class FakeOpenCode:
 class FakeWorker:
     def __init__(self) -> None:
         self.aws_calls: list[tuple[str, str | None, str | None]] = []
+        self.aws_formats: list[str] = []
         self.create_calls: list[dict[str, object]] = []
         self.get_calls: list[str] = []
         self.cancel_calls: list[str] = []
@@ -111,8 +113,12 @@ class FakeWorker:
         self.polls: dict[str, list[dict[str, object]]] = {}
         self.cancel_result: dict[str, object] | None = None
 
-    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None):
+    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None, output_format: str = "text"):
         self.aws_calls.append((action, table, log_group))
+        self.aws_formats.append(output_format)
+        if output_format == "csv":
+            return {"state": "succeeded", "message": "CSV adjunto: hasta 10 registros.",
+                    "attachment": CsvAttachment("dynamodb.csv", b"task_id,task_available\r\n1,true\r\n")}
         return {"state": "succeeded", "message": "Tabla Tasks: ACTIVE (metadatos)."}
 
     async def create_codex_job(self, **kwargs: object):
@@ -1103,6 +1109,74 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.exchanges, ())
         self.assertIsNone(snapshot.conversation.active_repository)
         self.assertIsNone(snapshot.conversation.last_job_id)
+
+    async def test_aws_csv_is_durable_idempotent_and_excluded_from_memory(self) -> None:
+        self.orchestrator.aws_enabled = True
+        message = InboundMessage(960, 100, 200, "consulta registros de la tabla Tasks en DynamoDB en csv")
+        submission = await self.orchestrator.handle(message)
+        await self.orchestrator.handle(message)
+        self.assertEqual(self.worker.aws_calls, [("scan-dynamodb", "Tasks", None)])
+        self.assertEqual(self.worker.aws_formats, ["csv"])
+        pending = self.outbox.pending(KEY)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].attachment.filename, "dynamodb.csv")
+        self.assertIn(b"task_available", pending[0].attachment.data)
+        await self.flush_all()
+        self.assertEqual(self.storage.get_inbound(submission.request_id).status, RequestStatus.COMPLETED)
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_csv_followup_requeries_same_resource_and_discloses_fresh_read(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(961, 100, 200, "ver logs del grupo /aws/lambda/Prod en CloudWatch"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(962, 100, 200, "dámelo en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("read-logs", None, "/aws/lambda/Prod"))
+        self.assertEqual(self.worker.aws_formats, ["text", "csv"])
+        self.assertIn("Volví a consultar", " ".join(await self.flush_all()))
+        await self.orchestrator.handle(InboundMessage(963, 100, 200, "en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("read-logs", None, "/aws/lambda/Prod"))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_csv_followup_cannot_cross_conversations_or_forgotten_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(964, 100, 200, "lista tablas DynamoDB"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(965, 101, 200, "dámelo en csv"))
+        await self.orchestrator.handle(InboundMessage(966, 100, 201, "dámelo en csv"))
+        self.assertEqual(len(self.worker.aws_calls), 1)
+        await self.orchestrator.handle(InboundMessage(967, 100, 200, "olvida la conversación"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(968, 100, 200, "dámelo en csv"))
+        self.assertIn("No encontré una consulta AWS", " ".join(await self.flush_all()))
+        self.assertEqual(len(self.worker.aws_calls), 1)
+        self.assertEqual(self.opencode.calls, [])
+
+    async def test_csv_followup_skips_failed_queries_and_help(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(969, 100, 200, "lista tablas DynamoDB"))
+        await self.flush_all()
+        original = self.worker.query_aws
+        async def failed_query(*args, **kwargs):
+            return {"state": "failed", "message": "Sin acceso"}
+        self.worker.query_aws = failed_query
+        await self.orchestrator.handle(InboundMessage(970, 100, 200, "describe la tabla Other en DynamoDB"))
+        self.worker.query_aws = original
+        await self.orchestrator.handle(InboundMessage(971, 100, 200, "consulta AWS"))
+        await self.orchestrator.handle(InboundMessage(972, 100, 200, "dámelo en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("list-dynamodb", None, None))
+
+    async def test_csv_success_without_attachment_is_an_error(self) -> None:
+        self.orchestrator.aws_enabled = True
+        async def missing(*args, **kwargs):
+            return {"state": "succeeded", "message": "CSV listo"}
+        self.worker.query_aws = missing
+        submission = await self.orchestrator.handle(InboundMessage(973, 100, 200, "lista tablas DynamoDB en csv"))
+        self.assertEqual(self.storage.get_inbound(submission.request_id).status, RequestStatus.FAILED)
+        self.assertIsNone(self.outbox.pending(KEY)[0].attachment)
+        self.assertIn("No pude", " ".join(await self.flush_all()))
 
     async def test_aws_runs_only_on_host_and_never_enters_model_context(self) -> None:
         self.orchestrator.aws_enabled = True

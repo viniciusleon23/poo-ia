@@ -24,6 +24,31 @@ class FakeRunner:
 
 
 class AwsQueriesTests(unittest.TestCase):
+    def test_csv_attachment_uses_structured_full_values_and_existing_page_limits(self) -> None:
+        import base64
+        import csv
+        import io
+        content = "x" * 1800
+        runner = FakeRunner(CommandResult(0, json.dumps({"Items": [{"text": {"S": content}}]})))
+        report = AwsQueries(self.settings(), runner=runner).query("scan-dynamodb", table="Tasks", output_format="csv")
+        rows = list(csv.reader(io.StringIO(base64.b64decode(report["attachment"]["content_base64"]).decode("utf-8-sig"))))
+        self.assertEqual(rows[1][0], content)
+        self.assertIn("no es una exportación de toda la tabla", report["message"])
+        self.assertNotIn("1000", report["message"])
+        self.assertEqual(runner.calls[0][0][runner.calls[0][0].index("--limit") + 1], "10")
+
+    def test_invalid_csv_format_never_executes_and_failure_never_has_attachment(self) -> None:
+        runner = FakeRunner(CommandResult(1, "", "AccessDenied"))
+        service = AwsQueries(self.settings(), runner=runner)
+        for invalid in ("xlsx", "CSV", None, [], 1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                service.query("list-dynamodb", output_format=invalid)
+        self.assertEqual(runner.calls, [])
+        self.assertNotIn("attachment", service.query("list-dynamodb", output_format="csv"))
+        runner.result = CommandResult(0, json.dumps({"Events": [{"Timestamp": 1_800_000_000_000, "Message": "é" * 70_000}]}))
+        report = service.query("read-logs", log_group="/aws/tasks", output_format="csv")
+        self.assertEqual(report["error_code"], "csv-too-large")
+        self.assertNotIn("attachment", report)
     def test_large_plain_log_excerpt_is_bounded_without_suffix_rescanning(self) -> None:
         text, truncated = _excerpt("a" * 65_536, 300)
         self.assertEqual(text, "a" * 299 + "…")

@@ -131,11 +131,11 @@ async def list_repositories(request: web.Request) -> web.Response:
 
 async def query_aws(request: web.Request) -> web.Response:
     payload = await _json_object(request)
-    if set(payload) - {"action", "table", "log_group"} or not isinstance(payload.get("action"), str):
+    if set(payload) - {"action", "table", "log_group", "format"} or not isinstance(payload.get("action"), str):
         raise ValueError("La consulta AWS requiere una operación permitida y el recurso correspondiente.")
     result = await asyncio.to_thread(
         request.app[AWS_QUERIES_KEY].query,
-        payload["action"], table=payload.get("table"), log_group=payload.get("log_group"),
+        payload["action"], table=payload.get("table"), log_group=payload.get("log_group"), output_format=payload.get("format", "text"),
     )
     return web.json_response({"result": result})
 

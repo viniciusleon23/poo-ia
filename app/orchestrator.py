@@ -15,6 +15,7 @@ from .memory import MemoryStore
 from .models import (
     Backend,
     ConversationKey,
+    CsvAttachment,
     InboundMessage,
     InboundRequest,
     Intent,
@@ -39,6 +40,8 @@ from .router import (
     AMBIGUOUS_REPOSITORY,
     REPOSITORY_REQUIRED,
     explicitly_requests_code_change,
+    aws_csv_requested,
+    is_aws_csv_followup,
     parse_aws_query,
     route_message,
 )
@@ -57,6 +60,7 @@ AWS_QUERY_HELP = (
     "- consulta registros de la tabla NOMBRE en DynamoDB\n"
     "- lista grupos de CloudWatch\n"
     "- ver logs del grupo /NOMBRE en CloudWatch\n"
+    "Agrega «en csv» para recibir un archivo, o «dámelo en csv» después de una consulta. "
     "Listados: hasta 25 recursos. Datos: una página de hasta 10 registros o 20 eventos de la última hora. "
     "Estas operaciones solo leen; las modificaciones necesitan una solicitud explícita y un flujo separado."
 )
@@ -94,7 +98,8 @@ class OpenCodeLike(Protocol):
 
 
 class WorkerLike(Protocol):
-    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None) -> Mapping[str, object]: ...
+    async def query_aws(self, action: str, *, table: str | None = None,
+                        log_group: str | None = None, output_format: str = "text") -> Mapping[str, object]: ...
 
     async def create_codex_job(self, **kwargs: object) -> Mapping[str, object]: ...
 
@@ -565,7 +570,7 @@ class PooIAOrchestrator:
             text = await self._cancel_text(self._resolve_job(decision.job_id))
             self._enqueue_direct(request.request_id, text, remember=False)
         elif intent is Intent.AWS_REPORT:
-            await self._handle_aws_query(request.request_id, message.text)
+            await self._handle_aws_query(request.request_id, message)
         elif intent is Intent.CLARIFY:
             text = {
                 AMBIGUOUS_REPOSITORY: AMBIGUOUS_REPOSITORY_MESSAGE,
@@ -604,15 +609,33 @@ class PooIAOrchestrator:
             if self.aws_enabled and self.worker is not None:
                 text += (
                     " También puedo consultar DynamoDB y CloudWatch: tablas, registros y logs acotados. "
-                    "Estas consultas son de solo lectura desde el host."
+                    "Estas consultas son de solo lectura desde el host; agrega «en csv» para recibir un archivo."
                 )
             self._enqueue_direct(request.request_id, text, remember=False)
 
-    async def _handle_aws_query(self, request_id: str, message: str) -> None:
+    async def _handle_aws_query(self, request_id: str, message: InboundMessage) -> None:
         if not self.aws_enabled:
             self._enqueue_direct(request_id, AWS_DISABLED_MESSAGE, remember=False)
             return
-        query = parse_aws_query(message)
+        query = parse_aws_query(message.text)
+        csv_requested = aws_csv_requested(message.text)
+        followup = is_aws_csv_followup(message.text)
+        if query is None and followup:
+            for previous in self.storage.recent_aws_query_requests(
+                message.conversation_key, exclude_request_id=request_id,
+            ):
+                query = parse_aws_query(previous.text)
+                if query is not None:
+                    break
+            if query is None:
+                self._enqueue_direct(
+                    request_id,
+                    "No encontré una consulta AWS reciente en esta conversación. "
+                    "Indica la consulta y agrega «en csv», por ejemplo: "
+                    "«consulta registros de la tabla NOMBRE en DynamoDB en csv».",
+                    remember=False,
+                )
+                return
         if query is None:
             self._enqueue_direct(request_id, AWS_QUERY_HELP, remember=False)
             return
@@ -620,20 +643,30 @@ class PooIAOrchestrator:
             self._enqueue_direct(request_id, "El worker de consultas AWS no está disponible.", remember=False)
             return
         action, resource = query
+        attachment = None
         try:
+            format_options = {"output_format": "csv"} if csv_requested else {}
             report = await self.worker.query_aws(
                 action,
                 table=resource if action in {"describe-dynamodb", "scan-dynamodb"} else None,
                 log_group=resource if action == "read-logs" else None,
+                **format_options,
             )
             text = str(report["message"])
             if report.get("state") != "succeeded":
                 self.storage.update_request_status(request_id, RequestStatus.FAILED)
+            elif csv_requested:
+                attachment = report.get("attachment")
+                if not isinstance(attachment, CsvAttachment):
+                    raise ValueError("CSV export returned no validated attachment")
+                if followup:
+                    text = "Volví a consultar AWS para generar este CSV con los datos actuales.\n" + text
         except Exception:
             # The public transport error must not echo HTTP/CLI diagnostics.
             text = "No pude completar la consulta AWS mediante el worker del host."
+            attachment = None
             self.storage.update_request_status(request_id, RequestStatus.FAILED)
-        self._enqueue_direct(request_id, text, backend=Backend.WORKER, remember=False)
+        self._enqueue_direct(request_id, text, backend=Backend.WORKER, remember=False, attachment=attachment)
 
     async def record_processing_failure(
         self,
@@ -755,12 +788,14 @@ class PooIAOrchestrator:
         *,
         backend: Backend | None = Backend.STORAGE,
         remember: bool,
+        attachment: CsvAttachment | None = None,
     ) -> None:
         self.outbox.enqueue(
             request_id,
             text,
             backend=backend,
             remember_exchange=remember,
+            attachment=attachment,
         )
         if not remember:
             current = self.storage.get_inbound(request_id)

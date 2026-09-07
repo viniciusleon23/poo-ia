@@ -7,6 +7,8 @@ web interface.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Mapping
@@ -186,6 +188,35 @@ class JobEvent:
     created_at: float
 
 
+MAX_CSV_ATTACHMENT_BYTES = 128 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class CsvAttachment:
+    """A small in-memory CSV, never a path supplied by a worker or user."""
+
+    filename: str
+    data: bytes = field(repr=False)
+    content_type: str = "text/csv"
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.filename, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.csv", self.filename)
+        ):
+            raise ValueError("CSV filename must be a safe basename ending in .csv")
+        if not isinstance(self.data, bytes):
+            raise TypeError("CSV attachment data must be bytes")
+        if len(self.data) > MAX_CSV_ATTACHMENT_BYTES:
+            raise ValueError("CSV attachment exceeds the 128 KiB limit")
+        if self.content_type != "text/csv":
+            raise ValueError("CSV attachment content_type must be text/csv")
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class OutboxMessage:
     outbox_id: str
@@ -197,6 +228,7 @@ class OutboxMessage:
     exchange_on_complete: bool
     created_at: float
     completed_at: float | None
+    attachment: CsvAttachment | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -213,6 +245,7 @@ class OutboxPart:
     discord_message_id: str | None
     acked_at: float | None
     created_at: float
+    attachment: CsvAttachment | None = None
 
     @property
     def is_acknowledged(self) -> bool:

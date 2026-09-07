@@ -451,6 +451,12 @@ AWS se limita a DynamoDB y CloudWatch Logs. Permite listar y describir tablas, c
 
 Ejemplos: `lista las tablas DynamoDB`, `describe la tabla DynamoDB nombre-tabla`, `consulta registros de la tabla nombre-tabla en DynamoDB`, `lista grupos de CloudWatch`, `ver logs del grupo /aws/lambda/servicio en CloudWatch`.
 
+Agrega `en csv` para recibir un archivo adjunto descargable: `consulta registros de la tabla nombre-tabla en DynamoDB en csv` o `ver logs del grupo /aws/lambda/servicio en CloudWatch en csv`. También puedes pedir `dámelo en csv` después de una consulta: se repite la última consulta explícita entre las diez solicitudes AWS satisfactorias más recientes de esa misma conversación y se avisa que son datos actuales. `olvida la conversación` elimina ese contexto para futuras exportaciones.
+
+El archivo usa UTF-8 con BOM, conserva las celdas completas y tiene un máximo de 128 KiB. Mantiene los límites de consulta (10 registros evaluados, 20 eventos de la última hora o 25 recursos), e indica resultados parciales; no exporta toda la tabla ni el historial completo. Los atributos DynamoDB forman columnas, los valores anidados se representan como JSON y sus números se conservan como cadenas para no perder precisión. Se neutralizan fórmulas en cadenas y encabezados y se ocultan patrones comunes de credenciales. Si el archivo supera el límite o hay columnas que colisionan tras esa protección, la operación falla sin entregar un CSV recortado.
+
+El CSV se guarda en SQLite junto con la respuesta pendiente y se adjunta a su primera parte. Los reintentos de entrega reutilizan esos bytes, sin ejecutar otra consulta AWS ni enviar el contenido a modelos. La migración `004_outbox_attachments.sql` incorpora este almacenamiento y elimina los adjuntos cuando vence la retención de su respuesta entregada.
+
 ## Secretos y datos privados
 
 - `.env`, `opencode-server.env` y `worker.env` deben tener permisos `600` y no pertenecen al repositorio.

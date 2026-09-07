@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import unittest
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.config import Settings
 from app.discord_bot import PROCESSING_FAILED_MESSAGE, PooIAClient
-from app.models import ConversationKey, InboundMessage, OutboxPart
+from app.models import ConversationKey, CsvAttachment, InboundMessage, OutboxPart
 
 
 def settings() -> Settings:
@@ -129,6 +130,35 @@ def part(content: str = "respuesta") -> OutboxPart:
 
 
 class DiscordDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_csv_and_text_share_one_send_and_retry_recreates_the_file(self) -> None:
+        class AttachmentChannel(FakeChannel):
+            def __init__(self):
+                super().__init__()
+                self.uploads = []
+                self.streams = []
+
+            async def send(self, content, *, file, allowed_mentions):
+                self.uploads.append((content, file.filename, file.fp.read(), allowed_mentions.to_dict()))
+                self.streams.append(file.fp)
+                if len(self.uploads) == 1:
+                    raise ConnectionError("interrupted upload")
+                return SimpleNamespace(id=902)
+
+        channel = AttachmentChannel()
+        client = AdapterClient(channel)
+        csv = CsvAttachment("tasks.csv", b"id,available\n1,true\n")
+        output = replace(part("Resultado @everyone"), attachment=csv)
+        with self.assertRaises(ConnectionError):
+            await client._send_outbox_part(output)
+        sent = await client._send_outbox_part(output)
+
+        self.assertEqual(sent.id, 902)
+        self.assertEqual(channel.uploads[0], channel.uploads[1])
+        self.assertEqual(channel.uploads[0][:3], ("Resultado @everyone", "tasks.csv", csv.data))
+        self.assertEqual(channel.uploads[0][3]["parse"], [])
+        self.assertIsNot(channel.streams[0], channel.streams[1])
+        self.assertTrue(all(stream.closed for stream in channel.streams))
+
     async def test_delivery_loop_backs_off_while_discord_is_not_ready(self) -> None:
         client = DisconnectedAdapterClient(FakeChannel())
         client._orchestrator = FakeOrchestrator(part())

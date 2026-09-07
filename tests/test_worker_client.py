@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import unittest
 
 import aiohttp
+from app.models import CsvAttachment
 
 from app.worker_client import (
     WorkerAuthenticationError,
@@ -52,6 +55,46 @@ def make_client(session: FakeSession) -> WorkerClient:
 
 
 class WorkerClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_csv_transport_is_validated_and_decoded_without_extra_fields(self) -> None:
+        data = b'\xef\xbb\xbftable_name\r\nTasks\r\n'
+        attachment = {"filename": "dynamodb.csv", "content_type": "text/csv",
+                      "content_base64": base64.b64encode(data).decode(),
+                      "sha256": hashlib.sha256(data).hexdigest()}
+        session = FakeSession(FakeResponse(200, {"result": {
+            "state": "succeeded", "message": "CSV adjunto", "attachment": attachment,
+            "internal": "not-for-delivery",
+        }}))
+        result = await make_client(session).query_aws("list-dynamodb", output_format="csv")
+        self.assertEqual(session.calls[0][2]["json"], {"action": "list-dynamodb", "format": "csv"})
+        self.assertEqual(result["attachment"], CsvAttachment("dynamodb.csv", data))
+        self.assertNotIn("internal", result)
+
+    async def test_invalid_csv_never_reaches_delivery(self) -> None:
+        data = b"field\r\nvalue\r\n"
+        valid = {"filename": "query.csv", "content_type": "text/csv",
+                 "content_base64": base64.b64encode(data).decode(),
+                 "sha256": hashlib.sha256(data).hexdigest()}
+        invalid_attachments = (
+            None, {}, valid | {"filename": "../secret.csv"}, valid | {"filename": 17},
+            valid | {"content_type": "text/html"}, valid | {"sha256": "0" * 64},
+            valid | {"content_base64": "%%%"},
+            valid | {"content_base64": "a" * 174_769},
+            valid | {"content_base64": base64.b64encode(b"\xff").decode(), "sha256": hashlib.sha256(b"\xff").hexdigest()},
+        )
+        for attachment in invalid_attachments:
+            with self.subTest(attachment=type(attachment).__name__):
+                session = FakeSession(FakeResponse(200, {"result": {
+                    "state": "succeeded", "message": "CSV", "attachment": attachment,
+                }}))
+                with self.assertRaises(WorkerError):
+                    await make_client(session).query_aws("list-dynamodb", output_format="csv")
+        for state, output_format in (("failed", "csv"), ("succeeded", "text")):
+            session = FakeSession(FakeResponse(200, {"result": {
+                "state": state, "message": "AWS", "attachment": valid,
+            }}))
+            with self.assertRaises(WorkerError):
+                await make_client(session).query_aws("list-dynamodb", output_format=output_format)
+
     async def test_cloudwatch_query_sends_named_group_only(self) -> None:
         session = FakeSession(FakeResponse(200, {"result": {"state": "succeeded", "message": "Logs acotados"}}))
         await make_client(session).query_aws("read-logs", log_group="/aws/lambda/tasks")

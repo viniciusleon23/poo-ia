@@ -13,10 +13,33 @@ from app.router import (
     classify_intent,
     route_message,
     parse_aws_query,
+    aws_csv_requested,
+    is_aws_csv_followup,
 )
 
 
 class RouterTests(unittest.TestCase):
+    def test_csv_suffix_preserves_resource_case_and_fixed_read_operation(self) -> None:
+        for text, expected in (
+            ("lista las tablas DynamoDB en csv", ("list-dynamodb", None)),
+            ("consulta registros de la tabla MixedCase-Tasks en DynamoDB en formato CSV", ("scan-dynamodb", "MixedCase-Tasks")),
+            ("ver logs del grupo /aws/lambda/Prod en CloudWatch y dámelo en csv", ("read-logs", "/aws/lambda/Prod")),
+            ("describe la tabla Tasks en DynamoDB en csv por favor", ("describe-dynamodb", "Tasks")),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(aws_csv_requested(text))
+                self.assertEqual(parse_aws_query(text), expected)
+        self.assertIsNone(parse_aws_query("borra la tabla Tasks en DynamoDB en csv"))
+        self.assertIsNone(parse_aws_query("lista tablas DynamoDB en csv y borra todo"))
+
+    def test_csv_followups_are_narrow_and_do_not_capture_repository_changes(self) -> None:
+        for text in ("dámelo en CSV", "En csv", "regrésamelo en csv por favor", "¿y me puede regresar un csv?"):
+            self.assertTrue(is_aws_csv_followup(text))
+            self.assertIsNone(parse_aws_query(text))
+            self.assertEqual(classify_intent(text), Intent.AWS_REPORT)
+        self.assertEqual(classify_intent("agrega exportación CSV en el repo tasks"), Intent.CODE_CHANGE)
+        self.assertFalse(is_aws_csv_followup("explica cómo generar un csv"))
+
     def test_enabled_aws_only_routes_to_host_worker(self) -> None:
         decision = route_message("lista tablas de DynamoDB", aws_enabled=True)
         self.assertEqual(decision.intent, Intent.AWS_REPORT)

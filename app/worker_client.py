@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import re
+from datetime import date
 from typing import Any
 
 import aiohttp
@@ -77,7 +79,8 @@ class WorkerClient:
         return tuple(repositories)
 
     async def query_aws(self, action: str, *, table: str | None = None,
-                        log_group: str | None = None, output_format: str = "text") -> dict[str, object]:
+                        log_group: str | None = None, output_format: str = "text",
+                        business_query: dict[str, object] | None = None) -> dict[str, object]:
         """Request one fixed read operation; credentials stay on the host."""
         if output_format not in {"text", "csv"}:
             raise ValueError("Unsupported AWS output format")
@@ -88,6 +91,12 @@ class WorkerClient:
             payload["table"] = table
         if log_group is not None:
             payload["log_group"] = log_group
+        if business_query is not None:
+            if action != "count-planned-tasks" or not isinstance(business_query, dict):
+                raise ValueError("Unsupported business query")
+            if table is not None or log_group is not None:
+                raise ValueError("Business queries use host-configured resources")
+            payload["business_query"] = business_query
         response = await self._request_json("POST", "/v1/aws/query", payload)
         report = response.get("result")
         if (
@@ -98,6 +107,23 @@ class WorkerClient:
             or len(report["message"]) > 16_000
         ):
             raise WorkerError("El worker devolvió una respuesta AWS inválida.")
+        if action == "count-planned-tasks" and report["state"] == "succeeded":
+            count, pages = report.get("count"), report.get("pages")
+            day, zone = report.get("date"), report.get("time_zone")
+            valid_count = isinstance(count, int) and not isinstance(count, bool) and 0 <= count <= 50_000
+            valid_pages = isinstance(pages, int) and not isinstance(pages, bool) and 1 <= pages <= 100
+            valid_day = isinstance(day, str) and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", day))
+            if valid_day:
+                try:
+                    date.fromisoformat(day)
+                except ValueError:
+                    valid_day = False
+            valid_zone = isinstance(zone, str) and 1 <= len(zone) <= 128 and bool(
+                re.fullmatch(r"[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*", zone)
+            )
+            if (report.get("action") != action or report.get("complete") is not True
+                    or not valid_count or not valid_pages or not valid_day or not valid_zone):
+                raise WorkerError("El worker no confirmó un conteo completo de tareas.")
         # Only validated public fields cross into the durable delivery layer.
         result: dict[str, object] = {"state": report["state"], "message": report["message"]}
         raw_attachment = report.get("attachment")

@@ -37,6 +37,15 @@ def _aws_name(environment: Mapping[str, str], name: str, default: str) -> str:
     return value
 
 
+def _aws_table(environment: Mapping[str, str], name: str) -> str | None:
+    value = str(environment.get(name, "")).strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,255}", value):
+        raise WorkerConfigurationError(f"{name} must be a DynamoDB table name.")
+    return value
+
+
 def _value(environment: Mapping[str, str], name: str, default: str | None = None) -> str:
     raw = environment.get(name, default)
     value = "" if raw is None else str(raw).strip()
@@ -127,6 +136,8 @@ class WorkerSettings:
     aws_profile: str = "default"
     aws_region: str = "us-east-1"
     aws_query_timeout_seconds: float = 20.0
+    aws_tasks_table: str | None = None
+    aws_dealer_config_table: str | None = None
 
     @property
     def jobs_root(self) -> Path:
@@ -189,6 +200,8 @@ class WorkerSettings:
             aws_query_timeout_seconds=_positive_seconds(
                 source, "AWS_QUERY_TIMEOUT_SECONDS", 20.0
             ),
+            aws_tasks_table=_aws_table(source, "AWS_TASKS_TABLE"),
+            aws_dealer_config_table=_aws_table(source, "AWS_DEALER_CONFIG_TABLE"),
             max_changed_files=_positive_integer(source, "CODEX_MAX_CHANGED_FILES", 5),
             max_changed_lines=_positive_integer(source, "CODEX_MAX_CHANGED_LINES", 400),
             codex_timeout_seconds=_positive_seconds(source, "CODEX_TIMEOUT_SECONDS", 1800.0),

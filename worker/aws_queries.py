@@ -53,16 +53,27 @@ def _failure(code: str, message: str, *, state: str = "failed") -> dict[str, obj
 
 
 class AwsQueries:
-    def __init__(self, settings: WorkerSettings, *, runner: CommandRunner | None = None, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, settings: WorkerSettings, *, runner: CommandRunner | None = None, clock: Callable[[], float] = time.time, monotonic: Callable[[], float] = time.monotonic) -> None:
         self.settings = settings
         self.runner = runner or SubprocessCommandRunner(environment=_aws_environment())
         self.clock = clock
+        self.monotonic = monotonic
 
-    def query(self, action: str, *, table: str | None = None, log_group: str | None = None, output_format: str = "text") -> dict[str, object]:
+    def query(self, action: str, *, table: str | None = None, log_group: str | None = None, output_format: str = "text", business_query: dict[str, object] | None = None) -> dict[str, object]:
         if not isinstance(output_format, str) or output_format not in {"text", "csv"}:
             raise ValueError("El formato AWS debe ser text o csv.")
         if not self.settings.aws_enabled:
             return _failure("disabled", "Las consultas AWS están desactivadas en el worker.", state="disabled")
+        if action == "count-planned-tasks":
+            if table is not None or log_group is not None:
+                raise ValueError("La consulta de tareas usa sólo las tablas configuradas en el worker.")
+            from .business_queries import BusinessQueries
+            return BusinessQueries(
+                self.settings, runner=self.runner, provider_error=self._provider_error,
+                monotonic=self.monotonic,
+            ).count_planned_tasks(business_query, output_format=output_format)
+        if business_query is not None:
+            raise ValueError("Esta operación AWS no acepta una consulta de negocio.")
         if not isinstance(action, str) or action not in _OPERATIONS:
             raise ValueError("La operación AWS no está permitida.")
         if action in {"describe-dynamodb", "scan-dynamodb"}:

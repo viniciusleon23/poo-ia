@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .memory import MemoryStore
+from .business_queries import COUNT_PLANNED_TASKS, parse_business_query
 from .models import (
     Backend,
     ConversationKey,
@@ -56,6 +57,7 @@ AWS_DISABLED_MESSAGE = (
 )
 AWS_QUERY_HELP = (
     "Puedo consultar DynamoDB y CloudWatch desde el host. Operaciones disponibles:\n"
+    "- cuántas tareas planeadas hay mañana en el dealer DEALER_ID\n"
     "- lista tablas de DynamoDB\n"
     "- describe la tabla NOMBRE en DynamoDB\n"
     "- consulta registros de la tabla NOMBRE en DynamoDB\n"
@@ -63,6 +65,7 @@ AWS_QUERY_HELP = (
     "- ver logs del grupo /NOMBRE en CloudWatch\n"
     "Agrega «en csv» para recibir un archivo, o «dámelo en csv» después de una consulta. "
     "Listados: hasta 25 recursos. Datos: una página de hasta 10 registros o 20 eventos de la última hora. "
+    "El conteo de tareas planeadas incluye todos los tipos, estados y usuarios de un dealer en un día completo. "
     "Estas operaciones solo leen; las modificaciones necesitan una solicitud explícita y un flujo separado."
 )
 REPOSITORY_REQUIRED_MESSAGE = (
@@ -111,7 +114,8 @@ class OpenCodeLike(Protocol):
 
 class WorkerLike(Protocol):
     async def query_aws(self, action: str, *, table: str | None = None,
-                        log_group: str | None = None, output_format: str = "text") -> Mapping[str, object]: ...
+                        log_group: str | None = None, output_format: str = "text",
+                        business_query: Mapping[str, object] | None = None) -> Mapping[str, object]: ...
 
     async def create_codex_job(self, **kwargs: object) -> Mapping[str, object]: ...
 
@@ -642,6 +646,7 @@ class PooIAOrchestrator:
             if self.aws_enabled and self.worker is not None:
                 text += (
                     " También puedo consultar DynamoDB y CloudWatch: tablas, registros y logs acotados. "
+                    "Puedo contar las tareas planeadas de un dealer para hoy, mañana, ayer o una fecha YYYY-MM-DD, incluyendo todos los tipos. "
                     "Estas consultas son de solo lectura desde el host; agrega «en csv» para recibir un archivo."
                 )
             self._enqueue_direct(request.request_id, text, remember=False)
@@ -651,12 +656,31 @@ class PooIAOrchestrator:
             self._enqueue_direct(request_id, AWS_DISABLED_MESSAGE, remember=False)
             return
         query = parse_aws_query(message.text)
+        business = parse_business_query(message.text)
+        business_payload = None
+        if business is not None:
+            if business.clarification is not None:
+                self._enqueue_direct(request_id, business.clarification, remember=False)
+                return
+            request = self.storage.get_inbound(request_id)
+            if request is None or business.query is None:
+                raise ValueError("A business query requires its persisted request and validated plan")
+            query = (COUNT_PLANNED_TASKS, None)
+            business_payload = business.query.to_payload(request.created_at)
         csv_requested = aws_csv_requested(message.text)
         followup = is_aws_csv_followup(message.text)
         if query is None and followup:
             for previous in self.storage.recent_aws_query_requests(
                 message.conversation_key, exclude_request_id=request_id,
             ):
+                previous_business = parse_business_query(previous.text)
+                if previous_business is not None and previous_business.query is not None:
+                    query = (COUNT_PLANNED_TASKS, None)
+                    # An export repeats the same business day, even after
+                    # midnight or recovery. Its reading is fresh; its date
+                    # reference remains that of the original request.
+                    business_payload = previous_business.query.to_payload(previous.created_at)
+                    break
                 query = parse_aws_query(previous.text)
                 if query is not None:
                     break
@@ -678,7 +702,9 @@ class PooIAOrchestrator:
         action, resource = query
         attachment = None
         try:
-            format_options = {"output_format": "csv"} if csv_requested else {}
+            format_options: dict[str, object] = {"output_format": "csv"} if csv_requested else {}
+            if business_payload is not None:
+                format_options["business_query"] = business_payload
             report = await self.worker.query_aws(
                 action,
                 table=resource if action in {"describe-dynamodb", "scan-dynamodb"} else None,

@@ -12,6 +12,7 @@ import unicodedata
 from collections.abc import Iterable
 
 from .models import Backend, Intent, RouteDecision
+from .business_queries import parse_business_query
 from .repository_scope import (
     AMBIGUOUS_REPOSITORY,
     DOCUMENTATION_REPOSITORY_READ_ONLY,
@@ -189,6 +190,8 @@ def classify_intent(message: str, *, has_active_change: bool = False) -> Intent:
         return Intent.FORGET
     if normalized in CAPABILITY_PHRASES:
         return Intent.CAPABILITIES
+    if parse_business_query(message) is not None:
+        return Intent.AWS_REPORT
     if normalized in STATUS_PHRASES or _STATUS_PATTERN.search(normalized):
         return Intent.JOB_STATUS
     if _CANCEL_PATTERN.search(normalized):

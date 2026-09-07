@@ -55,6 +55,45 @@ def make_client(session: FakeSession) -> WorkerClient:
 
 
 class WorkerClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_business_query_uses_structured_parameters_and_public_delivery_only(self) -> None:
+        session = FakeSession(FakeResponse(200, {"result": {
+            "state": "succeeded", "message": "17 tareas planeadas.",
+            "action": "count-planned-tasks", "complete": True, "count": 17,
+            "pages": 2, "date": "2026-09-07", "time_zone": "America/Mexico_City",
+            "LastEvaluatedKey": "private-cursor", "Items": ["not-for-model"],
+        }}))
+        query = {"dealer_id": "COMAZDCALC2", "day": "tomorrow", "requested_at": 1_788_740_000.0}
+        result = await make_client(session).query_aws("count-planned-tasks", business_query=query)
+        self.assertEqual(session.calls[0][2]["json"], {
+            "action": "count-planned-tasks", "business_query": query,
+        })
+        self.assertEqual(result, {"state": "succeeded", "message": "17 tareas planeadas."})
+        for options in (
+            {"action": "list-dynamodb", "business_query": query},
+            {"action": "count-planned-tasks", "business_query": query, "table": "injected-table"},
+            {"action": "count-planned-tasks", "business_query": []},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                await make_client(session).query_aws(**options)
+        self.assertEqual(len(session.calls), 1)
+
+    async def test_business_success_requires_verified_complete_count_metadata(self) -> None:
+        valid = {"state": "succeeded", "message": "17 tareas planeadas.",
+                 "action": "count-planned-tasks", "complete": True, "count": 17,
+                 "pages": 2, "date": "2026-09-07", "time_zone": "America/Mexico_City"}
+        for invalid in (
+            {"complete": False}, {"complete": 1}, {"action": "scan-dynamodb"},
+            {"count": None}, {"count": True}, {"count": -1}, {"count": 50_001},
+            {"pages": 0}, {"pages": True}, {"pages": 101},
+            {"date": "2026-02-30"}, {"time_zone": ""},
+        ):
+            with self.subTest(invalid=invalid):
+                session = FakeSession(FakeResponse(200, {"result": valid | invalid}))
+                with self.assertRaises(WorkerError):
+                    await make_client(session).query_aws("count-planned-tasks", business_query={
+                        "dealer_id": "COMAZDCALC2", "day": "tomorrow", "requested_at": 100.0,
+                    })
+
     async def test_csv_transport_is_validated_and_decoded_without_extra_fields(self) -> None:
         data = b'\xef\xbb\xbftable_name\r\nTasks\r\n'
         attachment = {"filename": "dynamodb.csv", "content_type": "text/csv",

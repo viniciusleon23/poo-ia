@@ -374,7 +374,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.opencode.calls, [])
         self.assertEqual(
             self.storage.get_job(job.job_id).checkpoint,
-            {"opencode_session_id": "orphan-session"},
+            {"opencode_session_id": "orphan-session", "progress_phase": "research", "progress_at": 1000, "progress_revision": 1},
         )
 
     async def test_terminal_research_retries_orphan_cleanup_after_restart(self) -> None:
@@ -513,7 +513,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         running = self.storage.get_job(submission.job_id)
         self.assertEqual(
             running.checkpoint,
-            {"opencode_session_id": "session-1"},
+            {"opencode_session_id": "session-1", "progress_phase": "research", "progress_at": 1000, "progress_revision": 1},
         )
 
         self.opencode.release.set()
@@ -1028,7 +1028,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status.intent, Intent.JOB_STATUS)
         self.assertFalse(status.queued)
-        self.assertTrue(any(change.job_id[:8] in text and "prepared" in text for text in sent))
+        self.assertTrue(any(change.job_id[:8] in text and "preparado" in text for text in sent))
 
     async def test_cancel_control_interrupts_active_research_without_waiting_in_queue(self) -> None:
         self.opencode.block = True

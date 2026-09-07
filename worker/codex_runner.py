@@ -10,7 +10,7 @@ from pathlib import Path
 from app.repository_scope import is_documentation_repository
 
 from .config import WorkerSettings
-from .models import DiffMeasurement, JobState
+from .models import DiffMeasurement, JobPhase, JobState
 from .processes import (
     CommandResult,
     CommandRunner,
@@ -114,6 +114,7 @@ class CodexRunner:
                     raise ManifestStateError("job is already owned by another process")
                 return current.evolve(
                     state=JobState.RUNNING,
+                    phase=JobPhase.PREPARE,
                     process_pid=claimed_pid,
                     error=None,
                 )
@@ -170,6 +171,11 @@ class CodexRunner:
                 "-",
             )
             try:
+                self.store.update(
+                    job_id,
+                    expected=(JobState.RUNNING,),
+                    transform=lambda current: current.evolve(phase=JobPhase.EDIT),
+                )
                 result = self.command_runner.run(
                     command,
                     cwd=prepared.path,
@@ -218,6 +224,11 @@ class CodexRunner:
                 )
                 return
 
+            self.store.update(
+                job_id,
+                expected=(JobState.RUNNING,),
+                transform=lambda current: current.evolve(phase=JobPhase.VALIDATE),
+            )
             validation = self.validator.validate(
                 prepared.path,
                 base_repository=snapshot.path,
@@ -251,6 +262,11 @@ class CodexRunner:
                 else "Codex completed but produced no repository changes; the requested change was not confirmed."
             )
             from .documentation import record_process
+            manifest = self.store.update(
+                job_id,
+                expected=(JobState.RUNNING,),
+                transform=lambda current: current.evolve(phase=JobPhase.DOCUMENT),
+            )
             documentation = record_process(self.settings, manifest.evolve(
                 state=next_state, validation=validation, diff=measurement,
                 summary=summary, error=completion_error,
@@ -379,9 +395,11 @@ class CodexRunner:
     ) -> None:
         try:
             from .documentation import record_process
-            current = self.store.get(job_id)
-            if current.state not in {JobState.QUEUED, JobState.RUNNING}:
-                return
+            current = self.store.update(
+                job_id,
+                expected=(JobState.QUEUED, JobState.RUNNING),
+                transform=lambda current: current.evolve(phase=JobPhase.DOCUMENT),
+            )
             documentation = record_process(self.settings, current.evolve(
                 state=JobState.FAILED, error=error,
                 diff=diff if diff is not None else current.diff,

@@ -457,6 +457,12 @@ El archivo usa UTF-8 con BOM, conserva las celdas completas y tiene un máximo d
 
 El CSV se guarda en SQLite junto con la respuesta pendiente y se adjunta a su primera parte. Los reintentos de entrega reutilizan esos bytes, sin ejecutar otra consulta AWS ni enviar el contenido a modelos. La migración `004_outbox_attachments.sql` incorpora este almacenamiento y elimina los adjuntos cuando vence la retención de su respuesta entregada.
 
+## Respuestas durante la espera
+
+El bot marca la recepción con 👀 cuando Discord permite reacciones. Confirma de inmediato los trabajos en cola y, si una consulta directa tarda más de medio segundo, envía un aviso de recepción. Después comunica las etapas confirmadas: documentación del brain, preparación del repositorio, ejecución del cambio, pruebas, documentación del proceso y publicación del PR. Si pasan 60 segundos sin una nueva etapa, informa que continúa esperando y muestra la última etapa confirmada. No estima porcentajes ni tiempos de finalización.
+
+Los avisos no entran en memoria. Si Discord se desconecta, se conserva la confirmación y solo queda pendiente el progreso más reciente; al existir un resultado final se suprimen los progresos pendientes. Una falla en estos avisos no cancela el trabajo principal. Los fallos de reacción o typing tampoco impiden procesar la petición.
+
 ## Secretos y datos privados
 
 - `.env`, `opencode-server.env` y `worker.env` deben tener permisos `600` y no pertenecen al repositorio.

@@ -724,7 +724,8 @@ class SQLiteStorage:
             WHERE r.job_id IS NULL
               AND r.status IN (?, ?, ?)
               AND NOT EXISTS (
-                  SELECT 1 FROM outbox AS o WHERE o.request_id = r.request_id
+                  SELECT 1 FROM outbox AS o
+                  WHERE o.request_id = r.request_id AND o.kind IN ('response', 'error')
               )
             ORDER BY r.created_at, r.rowid
         """
@@ -992,7 +993,7 @@ class SQLiteStorage:
         *,
         now: float | None = None,
     ) -> Job:
-        """Persist remote ownership before a long RUNNING operation returns."""
+        """Persist ownership/progress during RUNNING or PUBLISHING operations."""
         timestamp = self._now(now)
         encoded = _json_object(checkpoint)
         with self._transaction() as connection:
@@ -1002,7 +1003,7 @@ class SQLiteStorage:
             if row is None:
                 raise KeyError(job_id)
             state = JobStatus(row["state"])
-            if state is not JobStatus.RUNNING:
+            if state not in {JobStatus.RUNNING, JobStatus.PUBLISHING}:
                 raise InvalidJobTransition(
                     f"job {job_id} cannot checkpoint while {state.value}"
                 )
@@ -1159,9 +1160,9 @@ class SQLiteStorage:
             raise ValueError("outbox parts must contain at least one non-empty string")
         if attachment is not None and not isinstance(attachment, CsvAttachment):
             raise ValueError("outbox attachment must be a CsvAttachment")
-        if attachment is not None:
-            # Exports and their potentially sensitive operational text never
-            # become conversational context, even if a caller forgets the flag.
+        if attachment is not None or kind in {"ack", "progress"}:
+            # Exports, receipts, and operational progress never become model
+            # context or complete a request, even if a caller forgets the flag.
             exchange_on_complete = False
         timestamp = self._now(now)
         outbox_id = deterministic_outbox_id(request_id, kind, dedupe_key)
@@ -1246,6 +1247,24 @@ class SQLiteStorage:
                     (outbox_id, attachment.filename, attachment.content_type,
                      attachment.data, attachment.sha256),
                 )
+            if kind in {"progress", "response", "error"}:
+                # Close superseded progress without fabricating a remote ACK.
+                # Keep its immutable content/dedupe key so recovery cannot send
+                # an old phase again. A final output also closes late progress.
+                # Receipt envelopes have kind='ack' and remain deliverable.
+                connection.execute(
+                    """
+                    UPDATE outbox SET completed_at = ?
+                    WHERE request_id = ? AND kind = 'progress' AND completed_at IS NULL
+                      AND (
+                          outbox_id <> ? OR EXISTS (
+                              SELECT 1 FROM outbox AS final
+                              WHERE final.request_id = ? AND final.kind IN ('response', 'error')
+                          )
+                      )
+                    """,
+                    (timestamp, request_id, outbox_id, request_id),
+                )
             row = connection.execute(
                 "SELECT * FROM outbox WHERE outbox_id = ?", (outbox_id,)
             ).fetchone()
@@ -1265,6 +1284,36 @@ class SQLiteStorage:
         with self._lock:
             row = self._connection.execute(
                 "SELECT 1 FROM outbox WHERE request_id = ? LIMIT 1", (request_id,)
+            ).fetchone()
+        return row is not None
+
+    def request_has_final_outbox(self, request_id: str) -> bool:
+        """Return whether a durable response/error already owns the result.
+
+        Receipts and progress alone must not prevent execution or recovery.
+        Pending final output counts too: delivery retries must reuse its bytes.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM outbox
+                WHERE request_id = ? AND kind IN ('response', 'error') LIMIT 1
+                """,
+                (request_id,),
+            ).fetchone()
+        return row is not None
+
+    def is_outbox_part_pending(self, outbox_id: str, part_index: int) -> bool:
+        """Recheck delivery eligibility after an earlier send yielded control."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT 1 FROM outbox_parts AS p
+                JOIN outbox AS o ON o.outbox_id = p.outbox_id
+                WHERE p.outbox_id = ? AND p.part_index = ?
+                  AND o.completed_at IS NULL AND p.acked_at IS NULL
+                """,
+                (outbox_id, part_index),
             ).fetchone()
         return row is not None
 

@@ -6,7 +6,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from worker.models import JobRequest, JobState
+from worker.models import JobManifest, JobPhase, JobRequest, JobState
 from worker.store import (
     IdempotencyConflictError,
     ManifestStateError,
@@ -80,6 +80,7 @@ class ManifestStoreTests(unittest.TestCase):
         stored.pop("base_branch")
         stored.pop("diff_sha256")
         stored.pop("terminal_at")
+        stored.pop("phase")
         path.write_text(json.dumps(stored), encoding="utf-8")
 
         loaded = ManifestStore(self.root).get("discord-123")
@@ -88,8 +89,48 @@ class ManifestStoreTests(unittest.TestCase):
         self.assertIsNone(loaded.base_branch)
         self.assertIsNone(loaded.diff_sha256)
         self.assertIsNone(loaded.terminal_at)
+        self.assertIsNone(loaded.phase)
+        self.assertIsNone(loaded.to_public_dict()["phase"])
         _, created = self.store.create_or_get(self.request)
         self.assertFalse(created)
+
+    def test_phase_round_trip_is_public_and_does_not_change_request_data(self) -> None:
+        original, _ = self.store.create_or_get(self.request)
+        for phase in JobPhase:
+            with self.subTest(phase=phase):
+                manifest = self.store.update(
+                    self.request.job_id,
+                    expected=(JobState.QUEUED, JobState.RUNNING),
+                    transform=lambda current: current.evolve(
+                        state=JobState.RUNNING, phase=phase,
+                    ),
+                )
+                loaded = ManifestStore(self.root).get(self.request.job_id)
+                self.assertEqual(loaded.phase, phase)
+                self.assertEqual(loaded.to_public_dict()["phase"], phase.value)
+                self.assertEqual(loaded.payload_hash, original.payload_hash)
+                self.assertEqual(loaded.prompt, original.prompt)
+                self.assertEqual(loaded.preflight, original.preflight)
+                self.assertEqual(loaded.state, JobState.RUNNING)
+                self.assertEqual(manifest, loaded)
+
+    def test_phase_is_restricted_and_cleared_when_work_stops(self) -> None:
+        original, _ = self.store.create_or_get(self.request)
+        active = original.evolve(state=JobState.RUNNING, phase=JobPhase.EDIT)
+        with self.assertRaises(ValueError):
+            active.evolve(phase="untrusted log output")
+        for state in (
+            JobState.QUEUED, JobState.PREPARED, JobState.SUCCEEDED,
+            JobState.FAILED, JobState.CANCELLED,
+        ):
+            with self.subTest(state=state):
+                stopped = active.evolve(state=state)
+                self.assertIsNone(stopped.phase)
+                self.assertIsNone(stopped.to_public_dict()["phase"])
+                # Also normalize a stale phase in an already stopped manifest.
+                stored = stopped.to_storage_dict()
+                stored["phase"] = "edit"
+                self.assertIsNone(JobManifest.from_storage_dict(stored).phase)
 
     def test_trusted_policy_participates_in_idempotency_hash(self) -> None:
         request = JobRequest(

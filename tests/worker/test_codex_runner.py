@@ -4,14 +4,18 @@ import os
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
+from queue import Queue
+from threading import Event
 from typing import Sequence
+from unittest.mock import patch
 
 from worker.codex_runner import CodexRunner
 from worker.config import WorkerSettings
-from worker.models import JobRequest, JobState, ValidationStatus
+from worker.models import JobPhase, JobRequest, JobState, ValidationStatus
 from worker.processes import (
     CommandResult,
     CommandRunner,
@@ -167,6 +171,92 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertIn("Trusted harness policy", prompt)
         self.assertIn("Always keep public API defaults backward compatible.", prompt)
 
+    def test_phases_are_durable_while_each_operation_is_blocked(self) -> None:
+        request = JobRequest("progress-change", "capnet-tasks", "Add a field")
+        original, _ = self.store.create_or_get(request)
+        commands = FakeCodexRunner()
+        runner = CodexRunner(self.settings, self.store, command_runner=commands)
+        entered: Queue[tuple[JobPhase, Event]] = Queue()
+
+        def pause(phase, operation):
+            def invoke(*args, **kwargs):
+                release = Event()
+                entered.put((phase, release))
+                if not release.wait(5):
+                    raise RuntimeError("test did not release the operation")
+                return operation(*args, **kwargs)
+            return invoke
+
+        command_run = commands.run
+        paused_edit = pause(JobPhase.EDIT, command_run)
+
+        def run_command(argv, **kwargs):
+            operation = paused_edit if argv[0] == "fake-codex" else command_run
+            return operation(argv, **kwargs)
+
+        documentation = {"state": "prepared", "path": "process.md"}
+        with (
+            patch.object(runner.repositories, "prepare", side_effect=pause(
+                JobPhase.PREPARE, runner.repositories.prepare,
+            )),
+            patch.object(commands, "run", side_effect=run_command),
+            patch.object(runner.validator, "validate", side_effect=pause(
+                JobPhase.VALIDATE, runner.validator.validate,
+            )),
+            patch("worker.documentation.record_process", side_effect=pause(
+                JobPhase.DOCUMENT, lambda *_: documentation,
+            )),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            future = executor.submit(runner.run, request.job_id)
+            for expected in (
+                JobPhase.PREPARE, JobPhase.EDIT, JobPhase.VALIDATE, JobPhase.DOCUMENT,
+            ):
+                phase, release = entered.get(timeout=5)
+                try:
+                    self.assertEqual(phase, expected)
+                    current = ManifestStore(self.settings.jobs_root).get(request.job_id)
+                    self.assertEqual(current.state, JobState.RUNNING)
+                    self.assertEqual(current.to_public_dict()["phase"], expected.value)
+                    self.assertEqual(current.payload_hash, original.payload_hash)
+                    self.assertEqual(current.prompt, original.prompt)
+                finally:
+                    release.set()
+            future.result(timeout=5)
+        final = self.store.get(request.job_id)
+        self.assertEqual(final.state, JobState.PREPARED)
+        self.assertEqual(final.documentation, documentation)
+        self.assertIsNone(final.phase)
+
+    def test_cancellation_during_edit_clears_phase_and_stops_next_stages(self) -> None:
+        request = JobRequest("progress-cancel", "capnet-tasks", "Add a field")
+        self.store.create_or_get(request)
+        commands = FakeCodexRunner()
+        runner = CodexRunner(self.settings, self.store, command_runner=commands)
+        command_run = commands.run
+
+        def cancel_during_edit(argv, **kwargs):
+            result = command_run(argv, **kwargs)
+            if argv[0] == "fake-codex":
+                self.assertEqual(self.store.get(request.job_id).phase, JobPhase.EDIT)
+                self.store.update(
+                    request.job_id, expected=(JobState.RUNNING,),
+                    transform=lambda current: current.evolve(state=JobState.CANCELLED),
+                )
+            return result
+
+        with (
+            patch.object(commands, "run", side_effect=cancel_during_edit),
+            patch.object(runner.validator, "validate") as validate,
+            patch("worker.documentation.record_process") as document,
+        ):
+            runner.run(request.job_id)
+            validate.assert_not_called()
+            document.assert_not_called()
+        final = self.store.get(request.job_id)
+        self.assertEqual(final.state, JobState.CANCELLED)
+        self.assertIsNone(final.phase)
+
     def test_timeout_fails_job_and_preserves_safe_state(self) -> None:
         request = JobRequest("discord-790", "capnet-tasks", "Small change")
         self.store.create_or_get(request)
@@ -179,6 +269,7 @@ class CodexRunnerTests(unittest.TestCase):
 
         manifest = self.store.get(request.job_id)
         self.assertEqual(manifest.state, JobState.FAILED)
+        self.assertIsNone(manifest.phase)
         self.assertIsNone(manifest.process_pid)
         self.assertIn("timeout", manifest.error)
         self.assertEqual(manifest.diff.changed_files, 1)
@@ -231,12 +322,24 @@ class CodexRunnerTests(unittest.TestCase):
 
     def test_timeout_is_documented_without_changing_failed_execution_state(self) -> None:
         from tests.worker.test_repositories import initialize_repository
+        from worker.documentation import record_process
         initialize_repository(self.workspace, "brain-capnet")
         request = JobRequest("documented-timeout", "capnet-tasks", "Agrega campo")
         self.store.create_or_get(request)
-        CodexRunner(self.settings, self.store, command_runner=FakeCodexRunner(timeout=True)).run(request.job_id)
+
+        def observe_documentation(settings, manifest):
+            current = self.store.get(request.job_id)
+            self.assertEqual(current.state, JobState.RUNNING)
+            self.assertEqual(current.phase, JobPhase.DOCUMENT)
+            self.assertEqual(manifest.state, JobState.FAILED)
+            return record_process(settings, manifest)
+
+        with patch("worker.documentation.record_process", side_effect=observe_documentation) as document:
+            CodexRunner(self.settings, self.store, command_runner=FakeCodexRunner(timeout=True)).run(request.job_id)
+            document.assert_called_once()
         manifest = self.store.get(request.job_id)
         self.assertEqual(manifest.state, JobState.FAILED)
+        self.assertIsNone(manifest.phase)
         self.assertEqual(manifest.documentation["state"], "prepared")
         self.assertIn("failed", Path(manifest.documentation["path"]).read_text())
 

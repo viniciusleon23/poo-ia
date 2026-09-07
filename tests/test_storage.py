@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from app.models import (
@@ -447,6 +448,41 @@ class InboundAndJobStorageTests(unittest.TestCase):
         self.assertEqual(cleaned.state, JobStatus.FAILED)
         self.assertEqual(cleaned.checkpoint, {"result_path": "keep"})
 
+    def test_publishing_progress_checkpoint_preserves_job_outcome_and_notification_ack(self) -> None:
+        job = self.storage.register_inbound(
+            message(84), job_kind=JobKind.CODEX, repository="capnet-next-lambda-tasks",
+            payload={"publish": True},
+        ).job
+        self.storage.transition_job(job.job_id, JobStatus.RUNNING, now=101)
+        self.storage.transition_job(
+            job.job_id, JobStatus.PREPARED, now=102, summary="Cambio preparado.",
+            branch="codex/test", checkpoint={"result_path": "keep"},
+        )
+        self.storage.mark_job_notification_completed(job.job_id, now=103)
+        publishing = self.storage.transition_job(
+            job.job_id, JobStatus.PUBLISHING, now=104, preserve_notification_ack=True,
+        )
+        events = self.storage.list_job_events(job.job_id)
+        checkpoint = dict(publishing.checkpoint, progress_phase="publish", progress_at=105)
+
+        updated = self.storage.update_running_job_checkpoint(job.job_id, checkpoint, now=105)
+
+        self.assertEqual(updated, replace(publishing, checkpoint=checkpoint, updated_at=105))
+        self.assertEqual(self.storage.list_job_events(job.job_id), events)
+
+    def test_operational_checkpoint_still_rejects_queued_prepared_and_terminal_jobs(self) -> None:
+        states = (JobStatus.QUEUED, JobStatus.PREPARED, JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED)
+        for index, state in enumerate(states, start=85):
+            with self.subTest(state=state):
+                job = self.storage.register_inbound(message(index), job_kind=JobKind.CODEX).job
+                if state is not JobStatus.QUEUED:
+                    self.storage.transition_job(job.job_id, JobStatus.RUNNING)
+                    self.storage.transition_job(job.job_id, state, checkpoint={"result_path": "keep"})
+                before = self.storage.get_job(job.job_id)
+                with self.assertRaises(InvalidJobTransition):
+                    self.storage.update_running_job_checkpoint(job.job_id, {"progress_phase": "publish"}, now=999)
+                self.assertEqual(self.storage.get_job(job.job_id), before)
+
     def test_operational_prune_keeps_nonterminal_jobs(self) -> None:
         terminal = self.storage.register_inbound(
             message(50, received_at=1), job_kind=JobKind.RESEARCH
@@ -588,6 +624,69 @@ class InboundAndJobStorageTests(unittest.TestCase):
             self.storage.set_conversation_context_for_request(
                 "missing-request", active_repository="anything"
             )
+
+
+class OperationalOutboxStorageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.storage = SQLiteStorage(":memory:")
+
+    def tearDown(self) -> None:
+        self.storage.close()
+
+    def enqueue(self, request_id: str, kind: str, key: str = "one"):
+        return self.storage.create_outbox(
+            request_id, kind=kind, dedupe_key=key, assistant_text=kind, parts=(kind,),
+            backend=Backend.STORAGE, exchange_on_complete=True, now=20,
+        )
+
+    def test_receipts_and_progress_preserve_direct_recovery_until_final_exists(self) -> None:
+        for index, kind in enumerate(("ack", "progress"), start=720):
+            request = self.storage.register_inbound(message(index), intent=Intent.AWS_REPORT).request
+            output = self.enqueue(request.request_id, kind)
+            self.assertFalse(output.exchange_on_complete)
+            self.assertTrue(self.storage.request_has_outbox(request.request_id))
+            self.assertFalse(self.storage.request_has_final_outbox(request.request_id))
+            self.storage.acknowledge_outbox_part(output.outbox_id, 0, f"sent-{kind}")
+        self.assertEqual([str(item.message_id) for item in self.storage.list_recoverable_direct_messages()], ["720", "721"])
+
+        requests = [self.storage.register_inbound(message(index)).request for index in (720, 721)]
+        for request, kind in zip(requests, ("response", "error")):
+            self.enqueue(request.request_id, kind)
+            self.assertTrue(self.storage.request_has_final_outbox(request.request_id))
+        self.assertEqual(self.storage.list_recoverable_direct_messages(), [])
+
+    def test_failed_final_insert_preserves_previous_progress(self) -> None:
+        request = self.storage.register_inbound(message(722)).request
+        progress = self.enqueue(request.request_id, "progress")
+        self.storage._connection.executescript(
+            "CREATE TRIGGER reject_final BEFORE INSERT ON outbox_parts "
+            "WHEN NEW.content = 'response' "
+            "BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.enqueue(request.request_id, "response")
+        self.assertFalse(self.storage.request_has_final_outbox(request.request_id))
+        self.assertFalse(self.storage.get_outbox(progress.outbox_id).is_complete)
+        self.assertEqual([part.outbox_id for part in self.storage.list_pending_outbox_parts()], [progress.outbox_id])
+
+    def test_progress_suppression_preserves_other_request_and_real_pending_receipt(self) -> None:
+        first = self.storage.register_inbound(message(723, received_at=1)).request
+        second = self.storage.register_inbound(message(724, received_at=1)).request
+        first_progress = self.enqueue(first.request_id, "progress")
+        receipt = self.enqueue(first.request_id, "ack")
+        other_progress = self.enqueue(second.request_id, "progress")
+        final = self.enqueue(first.request_id, "response")
+        self.storage.update_request_status(first.request_id, RequestStatus.COMPLETED, now=21)
+        self.storage.acknowledge_outbox_part(final.outbox_id, 0, "final-sent", now=22)
+        self.storage.prune(memory_retention_seconds=60, operational_retention_seconds=60, now=100)
+        self.assertIsNotNone(self.storage.get_inbound(first.request_id))
+        self.assertEqual({part.outbox_id for part in self.storage.list_pending_outbox_parts()}, {receipt.outbox_id, other_progress.outbox_id})
+        self.assertFalse(self.storage.is_outbox_part_pending(first_progress.outbox_id, 0))
+        self.assertTrue(self.storage.is_outbox_part_pending(receipt.outbox_id, 0))
+        self.storage.acknowledge_outbox_part(receipt.outbox_id, 0, "receipt-sent", now=101)
+        self.storage.prune(memory_retention_seconds=60, operational_retention_seconds=60, now=200)
+        self.assertIsNone(self.storage.get_inbound(first.request_id))
+        self.assertIsNotNone(self.storage.get_outbox(other_progress.outbox_id))
 
 
 class AttachmentStorageTests(unittest.TestCase):

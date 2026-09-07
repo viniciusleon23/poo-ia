@@ -30,6 +30,7 @@ from .models import (
 from .outbox import DurableOutbox
 from .prompt_loader import build_prompt, load_prompt_context
 from .preflight import build_preflight_request, parse_preflight
+from .progress import PHASES, ProgressReporter
 from .repository_scope import (
     DOCUMENTATION_REPOSITORY_READ_ONLY,
     UNKNOWN_REPOSITORY,
@@ -81,6 +82,17 @@ OPENCODE_RECOVERY_FAILED_MESSAGE = (
     "No pude confirmar la limpieza de una sesión documental anterior; "
     "el trabajo se cerró sin iniciar un reemplazo."
 )
+_STATE_LABELS = {
+    JobStatus.QUEUED: "en cola", JobStatus.RUNNING: "en ejecución",
+    JobStatus.PREPARED: "preparado", JobStatus.PUBLISHING: "publicando el PR",
+    JobStatus.SUCCEEDED: "completado", JobStatus.FAILED: "fallido",
+    JobStatus.CANCELLED: "cancelado",
+}
+_VALIDATION_LABELS = {
+    ValidationStatus.PASSED: "aprobada", ValidationStatus.FAILED: "fallida",
+    ValidationStatus.UNCHANGED_FAILURE: "fallos previos, sin nuevos fallos",
+    ValidationStatus.UNAVAILABLE: "no disponible", ValidationStatus.TIMED_OUT: "tiempo agotado",
+}
 
 
 class OllamaLike(Protocol):
@@ -154,6 +166,8 @@ class PooIAOrchestrator:
         worker_poll_seconds: float = 2.0,
         aws_enabled: bool = False,
         clock: Callable[[], float] = time.time,
+        progress_interval_seconds: float = 60.0,
+        receipt_delay_seconds: float = 0.5,
     ) -> None:
         if worker_poll_seconds <= 0:
             raise ValueError("worker_poll_seconds must be positive")
@@ -171,6 +185,10 @@ class PooIAOrchestrator:
         self.worker_poll_seconds = worker_poll_seconds
         self._clock = clock
         self._output_available = asyncio.Event()
+        self.progress = ProgressReporter(
+            storage, outbox, self._output_available.set, clock=clock,
+            interval_seconds=progress_interval_seconds, receipt_delay_seconds=receipt_delay_seconds,
+        )
         self._start_lock = asyncio.Lock()
         self._direct_recovery_complete = False
         self._initial_session_sweep_complete = False
@@ -202,6 +220,7 @@ class PooIAOrchestrator:
                     await self._recover_direct_message(message)
                 self._direct_recovery_complete = True
             await self.scheduler.start()
+            self.progress.start()
         # Let an immediate cleanup complete without waiting for slow or broken
         # OpenCode I/O. The task remains tracked and retryable on later starts.
         await asyncio.sleep(0)
@@ -227,6 +246,7 @@ class PooIAOrchestrator:
             await asyncio.gather(*remote_cleanups, return_exceptions=True)
         self._remote_session_cleanups.clear()
         await self.scheduler.close()
+        await self.progress.close()
 
     async def _cleanup_orphaned_opencode_sessions(
         self, *, terminal: bool
@@ -442,7 +462,7 @@ class PooIAOrchestrator:
             if not registration.created:
                 if (
                     registration.job is None
-                    and not self.storage.request_has_outbox(
+                    and not self.storage.request_has_final_outbox(
                         registration.request.request_id
                     )
                     and registration.request.status is not RequestStatus.COMPLETED
@@ -477,9 +497,11 @@ class PooIAOrchestrator:
                     snapshot.conversation.active_repository,
                 )
             else:
-                self.outbox.enqueue_progress(
+                self.outbox.enqueue(
                     request_id,
-                    f"Trabajo {registration.job.job_id[:8]} en cola.",
+                    f"Recibí tu solicitud. Trabajo {registration.job.job_id[:8]} en cola. "
+                    "Te avisaré cuando comience y al cambiar de etapa.",
+                    kind="ack", remember_exchange=False,
                     dedupe_key="queued",
                 )
                 self._output_available.set()
@@ -502,7 +524,7 @@ class PooIAOrchestrator:
             if (
                 registration.job is not None
                 or request.status is RequestStatus.COMPLETED
-                or self.storage.request_has_outbox(request.request_id)
+                or self.storage.request_has_final_outbox(request.request_id)
             ):
                 return
             snapshot = self.memory.snapshot(key)
@@ -522,7 +544,7 @@ class PooIAOrchestrator:
                     snapshot.conversation.active_repository,
                 )
             except Exception:
-                if not self.storage.request_has_outbox(request.request_id):
+                if not self.storage.request_has_final_outbox(request.request_id):
                     self.storage.update_request_status(
                         request.request_id, RequestStatus.FAILED
                     )
@@ -541,8 +563,19 @@ class PooIAOrchestrator:
         conversation_context: str,
         active_repository: str | None,
     ) -> None:
+        async with self.progress.direct(request.request_id, request.intent):
+            await self._execute_registered_direct(message, request, decision, conversation_context, active_repository)
+
+    async def _execute_registered_direct(
+        self,
+        message: InboundMessage,
+        request: InboundRequest,
+        decision: RouteDecision,
+        conversation_context: str,
+        active_repository: str | None,
+    ) -> None:
         """Complete a no-job request using its persisted intent as authority."""
-        if self.storage.request_has_outbox(request.request_id):
+        if self.storage.request_has_final_outbox(request.request_id):
             return
         intent = request.intent
         if intent is None or intent in {Intent.RESEARCH, Intent.CODE_CHANGE}:
@@ -692,7 +725,7 @@ class PooIAOrchestrator:
             if self.outbox.pending(message.conversation_key):
                 self._output_available.set()
             return False
-        if self.storage.request_has_outbox(request.request_id):
+        if self.storage.request_has_final_outbox(request.request_id):
             self._output_available.set()
             return False
         if request.status is RequestStatus.COMPLETED:
@@ -826,6 +859,7 @@ class PooIAOrchestrator:
         if job.kind is JobKind.RESEARCH:
             if self.opencode is None:
                 raise RuntimeError(OPENCODE_DISABLED_MESSAGE)
+            self.progress.phase(job.job_id, "research")
             result = await self._run_checkpointed_research(
                 job,
                 str(job.payload.get("question", "")),
@@ -861,6 +895,7 @@ class PooIAOrchestrator:
             if not bool(job.payload.get("skip_preflight")):
                 if self.opencode is None:
                     raise RuntimeError(OPENCODE_DISABLED_MESSAGE)
+                self.progress.phase(job.job_id, "preflight")
                 preflight = await self._run_checkpointed_research(
                     job,
                     build_preflight_request(prompt, repository),
@@ -874,6 +909,7 @@ class PooIAOrchestrator:
                 evidence = parse_preflight(preflight, repository)
                 target_files = evidence.files
                 preflight = evidence.to_context()
+            self.progress.phase(job.job_id, "worker_wait")
             manifest = await self.worker.create_codex_job(
                 job_id=job.job_id,
                 repository=repository,
@@ -899,6 +935,7 @@ class PooIAOrchestrator:
             if is_documentation_repository(target.repository):
                 raise RuntimeError("El PR de ejecución no puede publicarse en el brain documental.")
             notification_was_completed = target.notification_completed_at is not None
+            self.progress.phase(job.job_id, "publish")
             manifest = await self.worker.publish_job(
                 target_id, override=bool(job.payload.get("override"))
             )
@@ -906,6 +943,7 @@ class PooIAOrchestrator:
                 target_id,
                 manifest,
                 preserve_notification_ack=notification_was_completed,
+                progress_job_id=job.job_id,
             )
             if target_outcome.state is JobStatus.PREPARED:
                 return JobOutcome(
@@ -982,12 +1020,18 @@ class PooIAOrchestrator:
         *,
         wait_for_publication: bool = False,
         preserve_notification_ack: bool = False,
+        progress_job_id: str | None = None,
     ) -> JobOutcome:
         if self.worker is None:
             raise RuntimeError(WORKER_DISABLED_MESSAGE)
         prepared_observations = 0
         while True:
             state = self._manifest_state(manifest)
+            if state in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.PUBLISHING}:
+                phase = manifest.get("phase")
+                if not isinstance(phase, str) or phase not in {"prepare", "edit", "validate", "document", "publish"}:
+                    phase = "worker_wait" if state is JobStatus.QUEUED else "publish" if state is JobStatus.PUBLISHING else "execution"
+                self.progress.phase(progress_job_id or job_id, phase)
             if state is JobStatus.PREPARED and wait_for_publication:
                 prepared_observations += 1
                 # The detached worker records PREPARED just before its automatic
@@ -1169,6 +1213,8 @@ class PooIAOrchestrator:
         if job is None:
             return JOB_NOT_FOUND_MESSAGE
         refresh_warning = ""
+        display_state = job.state
+        phase = job.checkpoint.get("progress_phase")
         if self.worker is not None and job.kind in {JobKind.CODEX, JobKind.PUBLISH}:
             target_id = (
                 str(job.payload.get("target_job_id"))
@@ -1179,15 +1225,19 @@ class PooIAOrchestrator:
                 manifest = await self.worker.get_job(target_id)
                 self._synchronize_worker_manifest(target_id, manifest)
                 job = self.storage.get_job(job.job_id) or job
+                display_state = self._manifest_state(manifest)
+                phase = manifest.get("phase")
             except Exception:
                 refresh_warning = " No pude actualizar el estado remoto; muestro el último guardado."
         elapsed = max(0, int(self._clock() - job.created_at))
         details = [
-            f"Trabajo {job.job_id[:8]}: {job.state.value}.",
+            f"Trabajo {job.job_id[:8]}: {_STATE_LABELS[display_state]}.",
             f"Tiempo transcurrido: {elapsed}s.",
         ]
         if job.repository:
             details.append(f"Repositorio: {job.repository}.")
+        if isinstance(phase, str) and phase in PHASES:
+            details.append(f"Etapa: {PHASES[phase]}.")
         if job.summary:
             details.append(job.summary)
         if job.safe_error:
@@ -1210,6 +1260,8 @@ class PooIAOrchestrator:
         return self._format_cancel_result(cancelled)
 
     async def _on_job_finished(self, job: Job) -> None:
+        self.storage.remove_job_checkpoint_keys(job.job_id, ("progress_phase", "progress_at", "progress_revision"))
+        job = self.storage.get_job(job.job_id) or job
         if any(
             isinstance(job.checkpoint.get(key), str)
             and bool(str(job.checkpoint.get(key)).strip())
@@ -1261,13 +1313,13 @@ class PooIAOrchestrator:
 
     @staticmethod
     def _format_change_result(job: Job) -> str:
-        parts = [f"Trabajo {job.job_id[:8]} {job.state.value}."]
+        parts = [f"Trabajo {job.job_id[:8]}: {_STATE_LABELS[job.state]}."]
         if job.repository:
             parts.append(f"Repositorio: {job.repository}.")
         if job.branch:
             parts.append(f"Rama: {job.branch}.")
         if job.validation_status:
-            parts.append(f"Validación: {job.validation_status.value}.")
+            parts.append(f"Validación: {_VALIDATION_LABELS[job.validation_status]}.")
         if job.summary:
             parts.append(job.summary)
         if job.external_reference:
@@ -1289,6 +1341,8 @@ class PooIAOrchestrator:
                 )
             elif documentation.get("state") == "failed":
                 parts.append(f"Documentación pendiente: {documentation.get('error')}.")
+            elif documentation.get("state") == "integrated":
+                parts.append("Bitácora del proceso integrada en el brain.")
         return parts
 
     def _resolve_job(self, reference: str | None) -> Job | None:

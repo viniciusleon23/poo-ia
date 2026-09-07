@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from io import BytesIO
+from contextlib import asynccontextmanager
 
 import aiohttp
 import discord
@@ -30,6 +31,8 @@ from .worker_client import WorkerClient, WorkerError
 
 LOGGER = logging.getLogger(__name__)
 DISCORD_DELIVERY_BACKOFF_SECONDS = 2
+VISUAL_FEEDBACK_TIMEOUT_SECONDS = 2.0
+REPOSITORY_REFRESH_TIMEOUT_SECONDS = 2.0
 OLLAMA_UNAVAILABLE_MESSAGE = "No pude obtener una respuesta de Ollama. Inténtalo de nuevo en un momento."
 OPENCODE_DISABLED_MESSAGE = "El cerebro documental todavía no está habilitado. Inténtalo más tarde."
 OPENCODE_TIMEOUT_MESSAGE = "La consulta documental tardó demasiado. Inténtalo de nuevo en un momento."
@@ -235,9 +238,10 @@ class PooIAClient(discord.Client):
             text=message.content,
         )
         try:
-            if self._worker is not None and not orchestrator.repositories:
-                await self._refresh_worker_repositories(force=True)
-            async with message.channel.typing():
+            await self._show_receipt(message)
+            async with self._show_typing(message.channel):
+                if self._worker is not None and not orchestrator.repositories:
+                    await self._bounded_repository_refresh(force=True)
                 await orchestrator.handle(inbound)
         except Exception as error:
             LOGGER.exception("Failed to process Discord message %s: %s", message.id, error)
@@ -285,7 +289,7 @@ class PooIAClient(discord.Client):
         while not self.is_closed():
             try:
                 self._prune_storage_if_due()
-                await self._refresh_worker_repositories()
+                await self._bounded_repository_refresh()
                 available = await orchestrator.wait_for_output(timeout=30)
                 if not available:
                     continue
@@ -298,6 +302,41 @@ class PooIAClient(discord.Client):
             except Exception as error:
                 LOGGER.warning("Durable Discord delivery failed and will retry: %s", error)
                 await asyncio.sleep(2)
+
+    async def _show_receipt(self, message: discord.Message) -> None:
+        """A receipt reaction can appear before inventory or conversation locks."""
+        react = getattr(message, "add_reaction", None)
+        if not callable(react):
+            return
+        try:
+            await asyncio.wait_for(react("👀"), timeout=VISUAL_FEEDBACK_TIMEOUT_SECONDS)
+        except Exception:
+            LOGGER.debug("Receipt reaction unavailable; normal processing continues.")
+
+    @asynccontextmanager
+    async def _show_typing(self, channel):
+        context = None
+        entered = False
+        try:
+            context = channel.typing()
+            await asyncio.wait_for(context.__aenter__(), timeout=VISUAL_FEEDBACK_TIMEOUT_SECONDS)
+            entered = True
+        except Exception:
+            LOGGER.debug("Typing indicator unavailable; normal processing continues.")
+        try:
+            yield
+        finally:
+            if entered and context is not None:
+                try:
+                    await asyncio.wait_for(context.__aexit__(None, None, None), timeout=VISUAL_FEEDBACK_TIMEOUT_SECONDS)
+                except Exception:
+                    LOGGER.debug("Could not close the typing indicator.")
+
+    async def _bounded_repository_refresh(self, *, force: bool = False) -> None:
+        try:
+            await asyncio.wait_for(self._refresh_worker_repositories(force=force), timeout=REPOSITORY_REFRESH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            LOGGER.debug("Repository refresh deferred so feedback can be delivered.")
 
     def _prune_storage_if_due(self) -> bool:
         """Apply bounded retention hourly while a long-lived bot stays online."""

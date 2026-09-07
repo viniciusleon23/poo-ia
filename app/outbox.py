@@ -75,7 +75,11 @@ class DurableOutbox:
         dedupe_key: str,
         now: float | None = None,
     ) -> OutboxMessage:
-        """Enqueue operational progress that must never enter model memory."""
+        """Keep only the latest pending progress without entering model memory.
+
+        Each phase/heartbeat key is immutable across retries. Superseded phases
+        stay persisted for deduplication but are no longer sent to Discord.
+        """
         return self.enqueue(
             request_id,
             text,
@@ -120,6 +124,10 @@ class DurableOutbox:
         """
         sent = 0
         for part in self.pending(key):
+            # A final response or newer phase can arrive while an earlier send
+            # awaits Discord. Do not deliver obsolete parts from this snapshot.
+            if not self.storage.is_outbox_part_pending(part.outbox_id, part.part_index):
+                continue
             result = await sender(part)
             remote_id = getattr(result, "id", result)
             if remote_id is None:

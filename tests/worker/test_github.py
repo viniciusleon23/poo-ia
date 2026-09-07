@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from hashlib import sha256
 from pathlib import Path
+from queue import Queue
+from threading import Event
 from typing import Sequence
+from unittest.mock import patch
 
 from worker.config import WorkerSettings
 from worker.github import GitHubPublisher, PublicationError
 from worker.models import (
     DiffMeasurement,
+    JobPhase,
     JobRequest,
     JobState,
     ValidationResult,
@@ -218,6 +223,7 @@ class GitHubPublisherTests(unittest.TestCase):
         second = publisher.publish("discord-901")
 
         self.assertEqual(first.state, JobState.SUCCEEDED)
+        self.assertIsNone(first.phase)
         self.assertEqual(first.pr_url, "https://github.com/example/repo/pull/42")
         self.assertEqual(second.pr_url, first.pr_url)
         self.assertEqual(commands.calls, calls_after_first)
@@ -258,6 +264,96 @@ class GitHubPublisherTests(unittest.TestCase):
         self.assertTrue(
             any(call[:3] == ("fake-git", "show", "-s") for call in commands.calls)
         )
+
+    def test_publication_phases_are_visible_during_blocked_operations(self) -> None:
+        job_id = "progress-publish"
+        self.prepare(job_id)
+        original = self.store.get(job_id)
+        commands = FakePublicationRunner()
+        publisher = GitHubPublisher(self.settings, self.store, runner=commands)
+        entered: Queue[tuple[JobPhase, Event]] = Queue()
+
+        def pause(phase, operation):
+            def invoke(*args, **kwargs):
+                release = Event()
+                entered.put((phase, release))
+                if not release.wait(5):
+                    raise RuntimeError("test did not release the operation")
+                return operation(*args, **kwargs)
+            return invoke
+
+        command_run = commands.run
+        paused_publish = pause(JobPhase.PUBLISH, command_run)
+
+        def run_command(argv, **kwargs):
+            command = tuple(argv)
+            operation = paused_publish if (
+                command[:3] in {("fake-gh", "auth", "status"), ("fake-gh", "pr", "create")}
+                or command[:2] == ("fake-git", "push")
+            ) else command_run
+            return operation(argv, **kwargs)
+
+        documentation = {"state": "prepared", "path": "process.md"}
+        with (
+            patch.object(commands, "run", side_effect=run_command),
+            patch.object(publisher.validator, "validate", side_effect=pause(
+                JobPhase.VALIDATE, publisher.validator.validate,
+            )),
+            patch("worker.documentation.record_process", side_effect=pause(
+                JobPhase.DOCUMENT, lambda *_: documentation,
+            )),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            future = executor.submit(publisher.publish, job_id)
+            for expected in (
+                JobPhase.PUBLISH, JobPhase.VALIDATE, JobPhase.PUBLISH,
+                JobPhase.PUBLISH, JobPhase.DOCUMENT,
+            ):
+                phase, release = entered.get(timeout=5)
+                try:
+                    self.assertEqual(phase, expected)
+                    current = ManifestStore(self.settings.jobs_root).get(job_id)
+                    self.assertEqual(current.state, JobState.PUBLISHING)
+                    self.assertEqual(current.to_public_dict()["phase"], expected.value)
+                    self.assertEqual(current.payload_hash, original.payload_hash)
+                    self.assertEqual(current.prompt, original.prompt)
+                    self.assertIsNone(current.pr_url)
+                finally:
+                    release.set()
+            result = future.result(timeout=5)
+        self.assertEqual(result.state, JobState.SUCCEEDED)
+        self.assertEqual(result.documentation, documentation)
+        self.assertIsNone(result.phase)
+
+    def test_cancellation_during_validation_stops_publication_and_clears_phase(self) -> None:
+        job_id = "progress-publish-cancel"
+        self.prepare(job_id)
+        commands = FakePublicationRunner()
+        publisher = GitHubPublisher(self.settings, self.store, runner=commands)
+
+        def cancel_during_validation(*_args, **_kwargs):
+            self.assertEqual(self.store.get(job_id).phase, JobPhase.VALIDATE)
+            self.store.update(
+                job_id, expected=(JobState.PUBLISHING,),
+                transform=lambda current: current.evolve(state=JobState.CANCELLED),
+            )
+            return ValidationResult(ValidationStatus.PASSED)
+
+        with (
+            patch.object(publisher.validator, "validate", side_effect=cancel_during_validation),
+            patch("worker.documentation.record_process") as document,
+            self.assertRaises(PublicationError),
+        ):
+            publisher.publish(job_id)
+        document.assert_not_called()
+        final = self.store.get(job_id)
+        self.assertEqual(final.state, JobState.CANCELLED)
+        self.assertIsNone(final.phase)
+        self.assertFalse(any(
+            call[:2] in {("fake-git", "push"), ("fake-git", "commit")}
+            or call[:3] == ("fake-gh", "pr", "create")
+            for call in commands.calls
+        ))
 
     def test_retry_adopts_existing_pr_only_after_owned_commit_and_remote_match(self) -> None:
         self.prepare("discord-902")
@@ -411,6 +507,7 @@ class GitHubPublisherTests(unittest.TestCase):
                 runner=FakePublicationRunner(authenticated=False),
             ).publish("discord-903")
         self.assertEqual(self.store.get("discord-903").state, JobState.PREPARED)
+        self.assertIsNone(self.store.get("discord-903").phase)
 
     def test_remote_inspection_failure_happens_before_commit_or_push(self) -> None:
         self.prepare("discord-906")

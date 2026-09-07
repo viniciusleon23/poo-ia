@@ -33,6 +33,14 @@ class JobState(StrEnum):
 TERMINAL_STATES = {JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED}
 
 
+class JobPhase(StrEnum):
+    PREPARE = "prepare"
+    EDIT = "edit"
+    VALIDATE = "validate"
+    DOCUMENT = "document"
+    PUBLISH = "publish"
+
+
 class ValidationStatus(StrEnum):
     PASSED = "passed"
     UNCHANGED_FAILURE = "unchanged_failure"
@@ -174,6 +182,14 @@ class JobManifest:
     result_path: str | None = None
     target_files: tuple[str, ...] = ()
     documentation: dict[str, str] | None = None
+    phase: JobPhase | None = None
+
+    def __post_init__(self) -> None:
+        phase = JobPhase(self.phase) if self.phase is not None else None
+        # A phase describes work underway, never a queued or completed operation.
+        if self.state not in {JobState.RUNNING, JobState.PUBLISHING}:
+            phase = None
+        object.__setattr__(self, "phase", phase)
 
     @classmethod
     def from_request(cls, request: JobRequest) -> "JobManifest":
@@ -198,6 +214,7 @@ class JobManifest:
     def to_storage_dict(self) -> dict[str, object]:
         data = asdict(self)
         data["state"] = self.state.value
+        data["phase"] = self.phase.value if self.phase is not None else None
         data["validation"] = self.validation.to_dict() if self.validation else None
         data["diff"] = self.diff.to_dict() if self.diff else None
         return data

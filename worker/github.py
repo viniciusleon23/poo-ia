@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 
 from .config import WorkerSettings
-from .models import JobManifest, JobState, ValidationStatus
+from .models import JobManifest, JobPhase, JobState, ValidationStatus
 from .processes import (
     CommandResult,
     CommandRunner,
@@ -74,6 +74,7 @@ class GitHubPublisher:
             expected=(JobState.PREPARED,),
             transform=lambda current: current.evolve(
                 state=JobState.PUBLISHING,
+                phase=JobPhase.PUBLISH,
                 process_pid=process_pid,
                 error=None,
             ),
@@ -132,6 +133,11 @@ class GitHubPublisher:
 
     def _publish_claimed(self, manifest: JobManifest, *, override: bool) -> JobManifest:
         self._require_common_metadata(manifest)
+        manifest = self.store.update(
+            manifest.job_id,
+            expected=(JobState.PUBLISHING,),
+            transform=lambda current: current.evolve(phase=JobPhase.PUBLISH),
+        )
         assert manifest.worktree is not None
         assert manifest.branch is not None
         worktree = Path(manifest.worktree)
@@ -262,6 +268,11 @@ class GitHubPublisher:
     ) -> JobManifest:
         if not manifest.repo_path or not manifest.base_commit:
             raise PublicationError("prepared job is missing validation metadata paths")
+        manifest = self.store.update(
+            manifest.job_id,
+            expected=(JobState.PUBLISHING,),
+            transform=lambda current: current.evolve(phase=JobPhase.VALIDATE),
+        )
         validation = self.validator.validate(
             worktree,
             base_repository=Path(manifest.repo_path),
@@ -287,6 +298,7 @@ class GitHubPublisher:
             manifest.job_id,
             expected=(JobState.PUBLISHING,),
             transform=lambda current: current.evolve(
+                phase=JobPhase.PUBLISH,
                 validation=validation,
                 diff=measurement,
                 error=None,
@@ -471,7 +483,12 @@ class GitHubPublisher:
 
     def _succeed(self, job_id: str, url: str) -> JobManifest:
         from .documentation import record_process
-        documentation = record_process(self.settings, self.store.get(job_id).evolve(
+        manifest = self.store.update(
+            job_id,
+            expected=(JobState.PUBLISHING,),
+            transform=lambda current: current.evolve(phase=JobPhase.DOCUMENT),
+        )
+        documentation = record_process(self.settings, manifest.evolve(
             state=JobState.SUCCEEDED, pr_url=url, error=None,
         ))
         return self.store.update(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -130,6 +131,46 @@ def part(content: str = "respuesta") -> OutboxPart:
 
 
 class DiscordDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receipt_precedes_processing_and_visual_failures_do_not_abort_it(self) -> None:
+        events = []
+        class BrokenTyping(FakeChannel):
+            @asynccontextmanager
+            async def typing(self):
+                events.append("typing")
+                raise ConnectionError("typing unavailable")
+                yield
+        channel = BrokenTyping()
+        client = AdapterClient(channel)
+        self.addAsyncCleanup(client.close)
+        orchestrator = FakeOrchestrator(part())
+        original = orchestrator.handle
+        async def handle(message):
+            events.append("handle")
+            await original(message)
+        orchestrator.handle = handle
+        client._orchestrator = orchestrator
+        async def react(emoji):
+            events.append(emoji)
+            raise ConnectionError("reaction unavailable")
+        message = SimpleNamespace(id=801, channel=channel, content="hola", author=SimpleNamespace(id=200, bot=False), add_reaction=react)
+        await client.on_message(message)
+        self.assertEqual(events, ["👀", "typing", "handle"])
+        self.assertEqual(channel.sent, ["respuesta"])
+        self.assertEqual(orchestrator.failure_calls, [])
+        client._orchestrator = None
+
+    async def test_slow_inventory_cannot_hold_feedback_indefinitely(self) -> None:
+        client = AdapterClient(FakeChannel())
+        self.addAsyncCleanup(client.close)
+        started = asyncio.Event()
+        async def slow_refresh(*, force=False):
+            started.set()
+            await asyncio.Event().wait()
+        client._refresh_worker_repositories = slow_refresh
+        with patch("app.discord_bot.REPOSITORY_REFRESH_TIMEOUT_SECONDS", 0.01):
+            await asyncio.wait_for(client._bounded_repository_refresh(), timeout=0.2)
+        self.assertTrue(started.is_set())
+
     async def test_csv_and_text_share_one_send_and_retry_recreates_the_file(self) -> None:
         class AttachmentChannel(FakeChannel):
             def __init__(self):

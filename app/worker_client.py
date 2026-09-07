@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 from typing import Any
 
 import aiohttp
+
+from .models import CsvAttachment
 
 
 class WorkerError(RuntimeError):
@@ -72,6 +76,54 @@ class WorkerClient:
             raise WorkerError("The worker returned an invalid repository inventory.")
         return tuple(repositories)
 
+    async def query_aws(self, action: str, *, table: str | None = None,
+                        log_group: str | None = None, output_format: str = "text") -> dict[str, object]:
+        """Request one fixed read operation; credentials stay on the host."""
+        if output_format not in {"text", "csv"}:
+            raise ValueError("Unsupported AWS output format")
+        payload: dict[str, object] = {"action": action}
+        if output_format == "csv":
+            payload["format"] = "csv"
+        if table is not None:
+            payload["table"] = table
+        if log_group is not None:
+            payload["log_group"] = log_group
+        response = await self._request_json("POST", "/v1/aws/query", payload)
+        report = response.get("result")
+        if (
+            not isinstance(report, dict)
+            or report.get("state") not in {"succeeded", "failed", "disabled"}
+            or not isinstance(report.get("message"), str)
+            or not report["message"].strip()
+            or len(report["message"]) > 16_000
+        ):
+            raise WorkerError("El worker devolvió una respuesta AWS inválida.")
+        # Only validated public fields cross into the durable delivery layer.
+        result: dict[str, object] = {"state": report["state"], "message": report["message"]}
+        raw_attachment = report.get("attachment")
+        expects_attachment = output_format == "csv" and report["state"] == "succeeded"
+        if expects_attachment:
+            try:
+                if not isinstance(raw_attachment, dict):
+                    raise ValueError("Missing CSV attachment")
+                encoded = raw_attachment.get("content_base64")
+                if not isinstance(encoded, str) or len(encoded) > 4 * ((128 * 1024 + 2) // 3):
+                    raise ValueError("Invalid CSV size")
+                attachment = CsvAttachment(
+                    filename=raw_attachment.get("filename"),
+                    data=base64.b64decode(encoded, validate=True),
+                    content_type=raw_attachment.get("content_type"),
+                )
+                if raw_attachment.get("sha256") != attachment.sha256:
+                    raise ValueError("CSV integrity mismatch")
+                attachment.data.decode("utf-8-sig")
+            except (ValueError, TypeError, binascii.Error) as error:
+                raise WorkerError("El worker devolvió un archivo CSV inválido.") from error
+            result["attachment"] = attachment
+        elif raw_attachment is not None:
+            raise WorkerError("El worker devolvió un archivo CSV inesperado.")
+        return result
+
     async def create_codex_job(
         self,
         *,
@@ -81,6 +133,7 @@ class WorkerClient:
         preflight: str | None = None,
         policy: str | None = None,
         publish: bool = False,
+        target_files: tuple[str, ...] = (),
     ) -> dict[str, object]:
         """Create or recover one idempotent Codex job."""
         payload: dict[str, object] = {
@@ -93,6 +146,8 @@ class WorkerClient:
             payload["preflight"] = preflight
         if policy:
             payload["policy"] = policy
+        if target_files:
+            payload["target_files"] = list(target_files)
         return await self._job_request("POST", "/v1/jobs/codex", payload)
 
     async def get_job(self, job_id: str) -> dict[str, object]:

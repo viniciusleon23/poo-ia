@@ -186,6 +186,7 @@ class Settings:
     worker_server_password: str | None = field(default=None, repr=False)
     worker_timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS
     worker_poll_seconds: float = DEFAULT_WORKER_POLL_SECONDS
+    aws_enabled: bool = False
 
     @classmethod
     def from_environment(
@@ -207,8 +208,9 @@ class Settings:
         if worker_enabled and worker_password is None:
             raise ConfigurationError("WORKER_SERVER_PASSWORD must be set when the worker is enabled.")
 
-        if _boolean(source, "AWS_ENABLED"):
-            raise ConfigurationError("AWS_ENABLED is not available in this phase; keep it false.")
+        aws_enabled = _boolean(source, "AWS_ENABLED")
+        if aws_enabled and not worker_enabled:
+            raise ConfigurationError("AWS_ENABLED requires WORKER_ENABLED and its authenticated host worker.")
 
         job_max_concurrent = _positive_count(
             source, "JOB_MAX_CONCURRENT", DEFAULT_JOB_MAX_CONCURRENT
@@ -228,6 +230,7 @@ class Settings:
                 source, "OLLAMA_TIMEOUT_SECONDS", DEFAULT_OLLAMA_TIMEOUT_SECONDS
             ),
             content_root=root,
+            aws_enabled=aws_enabled,
             opencode_enabled=opencode_enabled,
             opencode_base_url=_loopback_http_url(
                 source, "OPENCODE_BASE_URL", DEFAULT_OPENCODE_BASE_URL

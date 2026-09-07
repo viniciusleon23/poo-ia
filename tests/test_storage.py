@@ -9,6 +9,7 @@ from pathlib import Path
 from app.models import (
     Backend,
     ConversationKey,
+    CsvAttachment,
     InboundMessage,
     Intent,
     JobKind,
@@ -19,6 +20,7 @@ from app.storage import (
     InvalidJobTransition,
     SQLiteStorage,
     StorageConflictError,
+    StorageError,
     deterministic_job_id,
     deterministic_request_id,
 )
@@ -42,6 +44,28 @@ def message(
 
 
 class StorageMigrationTests(unittest.TestCase):
+    def test_version_three_outbox_survives_attachment_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            storage = SQLiteStorage(path)
+            request = storage.register_inbound(message(601)).request
+            output = storage.create_outbox(
+                request.request_id, kind="response", dedupe_key="final", assistant_text="text-only",
+                parts=("text-only",), backend=Backend.WORKER, exchange_on_complete=False,
+            )
+            storage.close()
+            with sqlite3.connect(path) as connection:
+                connection.execute("DROP TABLE outbox_attachments")
+                connection.execute("DELETE FROM schema_migrations WHERE version = 4")
+            upgraded = SQLiteStorage(path)
+            self.assertEqual(upgraded.schema_version, 4)
+            self.assertIsNone(upgraded.get_outbox(output.outbox_id).attachment)
+            part = upgraded.list_pending_outbox_parts()[0]
+            self.assertEqual(part.content, "text-only")
+            self.assertIsNone(part.attachment)
+            upgraded.acknowledge_outbox_part(part.outbox_id, part.part_index, "existing-text")
+            upgraded.close()
+
     def test_migration_is_idempotent_and_file_data_survives_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "poo-ia.sqlite3"
@@ -49,13 +73,13 @@ class StorageMigrationTests(unittest.TestCase):
             registration = first.register_inbound(
                 message(1), intent=Intent.RESEARCH, backend=Backend.OPENCODE
             )
-            self.assertEqual(first.schema_version, 2)
+            self.assertEqual(first.schema_version, 4)
             self.assertEqual(first.journal_mode, "wal")
             self.assertTrue(first.foreign_keys_enabled)
             first.close()
 
             second = SQLiteStorage(path)
-            self.assertEqual(second.schema_version, 2)
+            self.assertEqual(second.schema_version, 4)
             self.assertEqual(
                 second.get_inbound(registration.request.request_id), registration.request
             )
@@ -67,6 +91,24 @@ class StorageMigrationTests(unittest.TestCase):
             directory_path.mkdir()
             with self.assertRaises(Exception):
                 SQLiteStorage(directory_path)
+
+    def test_execution_context_migration_clears_brain_and_preserves_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.sqlite3"
+            storage = SQLiteStorage(path)
+            brain_key = ConversationKey("discord", 100, 200)
+            service_key = ConversationKey("discord", 101, 200)
+            storage.set_conversation_context(brain_key, active_repository="brain-capnet", last_job_id="old-brain")
+            storage.set_conversation_context(service_key, active_repository="capnet-next-lambda-tasks", last_job_id="service-job")
+            storage.close()
+            with sqlite3.connect(path) as connection:
+                connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+            upgraded = SQLiteStorage(path)
+            self.assertIsNone(upgraded.get_conversation(brain_key).active_repository)
+            self.assertIsNone(upgraded.get_conversation(brain_key).last_job_id)
+            self.assertEqual(upgraded.get_conversation(service_key).active_repository, "capnet-next-lambda-tasks")
+            self.assertEqual(upgraded.get_conversation(service_key).last_job_id, "service-job")
+            upgraded.close()
 
     def test_existing_version_one_database_receives_notification_ack_migration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -133,7 +175,7 @@ class StorageMigrationTests(unittest.TestCase):
             connection.close()
 
             storage = SQLiteStorage(path)
-            self.assertEqual(storage.schema_version, 2)
+            self.assertEqual(storage.schema_version, 4)
             self.assertEqual(
                 storage.get_job("job-v1").notification_completed_at, 3
             )
@@ -546,3 +588,109 @@ class InboundAndJobStorageTests(unittest.TestCase):
             self.storage.set_conversation_context_for_request(
                 "missing-request", active_repository="anything"
             )
+
+
+class AttachmentStorageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.storage = SQLiteStorage(":memory:")
+        self.request = self.storage.register_inbound(message(610, received_at=1)).request
+        self.csv = CsvAttachment("tasks.csv", b"id,available\n1,true\n")
+
+    def tearDown(self) -> None:
+        self.storage.close()
+
+    def enqueue(self):
+        return self.storage.create_outbox(
+            self.request.request_id, kind="response", dedupe_key="final", assistant_text="CSV listo",
+            parts=("CSV listo",), backend=Backend.WORKER, exchange_on_complete=True,
+            attachment=self.csv, now=2,
+        )
+
+    def test_attachment_is_an_integrity_checked_blob(self) -> None:
+        output = self.enqueue()
+        row = self.storage._connection.execute(
+            "SELECT typeof(data), sha256, content_type FROM outbox_attachments WHERE outbox_id = ?",
+            (output.outbox_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("blob", self.csv.sha256, "text/csv"))
+        self.storage._connection.execute(
+            "UPDATE outbox_attachments SET data = ? WHERE outbox_id = ?",
+            (b"tampered\n", output.outbox_id),
+        )
+        with self.assertRaisesRegex(StorageError, "integrity"):
+            self.storage.get_outbox(output.outbox_id)
+        with self.assertRaisesRegex(StorageError, "integrity"):
+            self.storage.list_pending_outbox_parts()
+
+    def test_attachment_insert_failure_rolls_back_envelope_and_parts(self) -> None:
+        self.storage._connection.executescript(
+            "CREATE TRIGGER reject_attachment BEFORE INSERT ON outbox_attachments "
+            "BEGIN SELECT RAISE(ABORT, 'simulated attachment failure'); END;"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.enqueue()
+        for table in ("outbox", "outbox_parts", "outbox_attachments"):
+            self.assertEqual(self.storage._connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0], 0)
+
+    def test_retention_keeps_pending_blob_and_cascades_after_ack(self) -> None:
+        output = self.enqueue()
+        self.storage.update_request_status(self.request.request_id, RequestStatus.COMPLETED, now=3)
+        self.storage.prune(
+            memory_retention_seconds=7 * 86_400, operational_retention_seconds=30 * 86_400,
+            now=31 * 86_400,
+        )
+        self.assertEqual(self.storage.get_outbox(output.outbox_id).attachment, self.csv)
+        self.storage.acknowledge_outbox_part(output.outbox_id, 0, "file-message", now=31 * 86_400 + 1)
+        self.storage.prune(
+            memory_retention_seconds=7 * 86_400, operational_retention_seconds=30 * 86_400,
+            now=31 * 86_400 + 2,
+        )
+        self.assertIsNone(self.storage.get_outbox(output.outbox_id))
+        self.assertEqual(self.storage._connection.execute("SELECT COUNT(*) FROM outbox_attachments").fetchone()[0], 0)
+        self.assertEqual(self.storage.list_exchanges(ConversationKey("discord", 100, 200)), [])
+
+
+class AwsRequestHistoryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.storage = SQLiteStorage(":memory:")
+        self.key = ConversationKey("discord", 100, 200)
+
+    def tearDown(self) -> None:
+        self.storage.close()
+
+    def completed_query(self, message_id, timestamp, *, status=RequestStatus.COMPLETED,
+                        output_backend=Backend.WORKER, user_id=200):
+        request = self.storage.register_inbound(
+            message(message_id, f"consulta AWS {message_id}", user_id=user_id, received_at=timestamp),
+            intent=Intent.AWS_REPORT, backend=Backend.WORKER,
+        ).request
+        self.storage.create_outbox(
+            request.request_id, kind="response", dedupe_key="final", assistant_text="reporte",
+            parts=("reporte",), backend=output_backend, exchange_on_complete=False, now=timestamp,
+        )
+        return self.storage.update_request_status(request.request_id, status, now=timestamp)
+
+    def test_history_is_scoped_successful_and_anchored_before_current_request(self) -> None:
+        earlier = self.completed_query(620, 10)
+        self.completed_query(621, 15, status=RequestStatus.FAILED)
+        self.completed_query(622, 20, output_backend=Backend.STORAGE)
+        self.completed_query(623, 25, user_id=999)
+        same_time_earlier = self.completed_query(624, 30)
+        current = self.storage.register_inbound(message(625, "damelo en csv", received_at=30)).request
+        self.completed_query(626, 30)
+        self.completed_query(627, 40)
+
+        recent = self.storage.recent_aws_query_requests(self.key, exclude_request_id=current.request_id)
+        self.assertEqual(recent, [same_time_earlier, earlier])
+        self.assertEqual(
+            self.storage.latest_aws_query_request(self.key, exclude_request_id=current.request_id),
+            same_time_earlier,
+        )
+        self.assertEqual(self.storage.list_exchanges(self.key), [])
+        self.assertEqual(self.storage.recent_aws_query_requests(self.key, exclude_request_id="missing"), [])
+
+    def test_forget_prevents_reusing_older_operational_query_as_context(self) -> None:
+        self.completed_query(628, 10)
+        self.storage.forget_conversation(self.key, now=20)
+        current = self.storage.register_inbound(message(629, "damelo en csv", received_at=30)).request
+        self.assertEqual(self.storage.recent_aws_query_requests(self.key, exclude_request_id=current.request_id), [])

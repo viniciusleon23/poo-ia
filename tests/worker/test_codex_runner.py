@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Sequence
@@ -18,6 +19,8 @@ from worker.processes import (
     SubprocessCommandRunner,
 )
 from worker.store import ManifestStore
+from worker.github import GitHubPublisher
+from worker.validation_sandbox import DockerValidationRunner
 
 
 def git(cwd: Path, *arguments: str) -> str:
@@ -117,6 +120,13 @@ class CodexRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_validation_activation_applies_to_changes_and_publication(self) -> None:
+        settings = replace(self.settings, validation_enabled=True)
+        for operation in (CodexRunner(settings, self.store), GitHubPublisher(settings, self.store)):
+            self.assertTrue(operation.validator.enabled)
+            self.assertIsInstance(operation.validator.test_runner, DockerValidationRunner)
+            self.assertEqual(operation.validator.test_runner.staging_root, settings.data_root / "validation")
+
     def test_prepares_change_with_codex_flags_context_and_diff(self) -> None:
         request = JobRequest(
             "discord-789",
@@ -180,6 +190,55 @@ class CodexRunnerTests(unittest.TestCase):
         )
         events = self.settings.jobs_root / request.job_id / "codex-events.jsonl"
         self.assertIn("partial", events.read_text(encoding="utf-8"))
+
+    def test_brain_cannot_be_submitted_as_execution_repository(self) -> None:
+        for repository in ("brain-capnet", "capnet-brain"):
+            with self.subTest(repository=repository), self.assertRaisesRegex(ValueError, "document"):
+                JobRequest("brain-rejected", repository, "Agrega un campo")
+
+    def test_legacy_brain_job_is_rejected_before_any_codex_execution(self) -> None:
+        self.store.create_or_get(JobRequest("legacy-brain", "capnet-tasks", "Agrega campo"))
+        self.store.update("legacy-brain", transform=lambda current: current.evolve(repository="brain-capnet"))
+        commands = FakeCodexRunner()
+        CodexRunner(self.settings, self.store, command_runner=commands).run("legacy-brain")
+        self.assertEqual(commands.codex_calls, [])
+        self.assertEqual(self.store.get("legacy-brain").state, JobState.FAILED)
+        self.assertIn("document", self.store.get("legacy-brain").error)
+
+    def test_preflight_file_cannot_escape_execution_worktree(self) -> None:
+        request = JobRequest("escaped-target", "capnet-tasks", "Agrega campo", target_files=("../brain-capnet/README.md",))
+        self.store.create_or_get(request)
+        commands = FakeCodexRunner()
+        CodexRunner(self.settings, self.store, command_runner=commands).run(request.job_id)
+        self.assertEqual(commands.codex_calls, [])
+        self.assertEqual(self.store.get(request.job_id).state, JobState.FAILED)
+
+    def test_execution_prepares_separate_brain_document_and_keeps_both_bases_clean(self) -> None:
+        from tests.worker.test_repositories import initialize_repository
+        brain = initialize_repository(self.workspace, "brain-capnet")
+        brain_head = git(brain, "rev-parse", "HEAD")
+        request = JobRequest("documented-change", "capnet-tasks", "Agrega campo")
+        self.store.create_or_get(request)
+        CodexRunner(self.settings, self.store, command_runner=FakeCodexRunner()).run(request.job_id)
+        manifest = self.store.get(request.job_id)
+        self.assertEqual(manifest.state, JobState.PREPARED)
+        self.assertEqual(manifest.documentation["state"], "prepared")
+        self.assertIn("capnet-tasks", Path(manifest.documentation["path"]).read_text())
+        self.assertNotIn(manifest.documentation["path"], Path(manifest.result_path).read_text())
+        self.assertEqual(git(brain, "status", "--porcelain"), "")
+        self.assertEqual(git(brain, "rev-parse", "HEAD"), brain_head)
+        self.assertEqual(git(self.repository, "status", "--porcelain"), "")
+
+    def test_timeout_is_documented_without_changing_failed_execution_state(self) -> None:
+        from tests.worker.test_repositories import initialize_repository
+        initialize_repository(self.workspace, "brain-capnet")
+        request = JobRequest("documented-timeout", "capnet-tasks", "Agrega campo")
+        self.store.create_or_get(request)
+        CodexRunner(self.settings, self.store, command_runner=FakeCodexRunner(timeout=True)).run(request.job_id)
+        manifest = self.store.get(request.job_id)
+        self.assertEqual(manifest.state, JobState.FAILED)
+        self.assertEqual(manifest.documentation["state"], "prepared")
+        self.assertIn("failed", Path(manifest.documentation["path"]).read_text())
 
     def test_zero_diff_fails_instead_of_reporting_a_false_success(self) -> None:
         request = JobRequest("discord-792", "capnet-tasks", "Small change")

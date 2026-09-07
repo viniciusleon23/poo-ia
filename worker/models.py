@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from app.repository_scope import is_documentation_repository
+
 
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,79}$")
 
@@ -47,12 +49,19 @@ class JobRequest:
     preflight: str = ""
     publish: bool = False
     policy: str = ""
+    target_files: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not JOB_ID_PATTERN.fullmatch(self.job_id):
             raise ValueError("job_id has an invalid format")
         if not self.repository.strip():
             raise ValueError("repository must not be empty")
+        if is_documentation_repository(self.repository):
+            raise ValueError("El brain es documental y no admite trabajos de ejecución.")
+        if not isinstance(self.target_files, tuple) or len(self.target_files) > 50 or any(
+            not isinstance(path, str) or not path or len(path) > 500 for path in self.target_files
+        ):
+            raise ValueError("target_files must contain at most 50 relative file paths")
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
         if (
@@ -72,6 +81,8 @@ class JobRequest:
         }
         if self.policy.strip():
             payload["policy"] = self.policy.strip()
+        if self.target_files:
+            payload["target_files"] = list(self.target_files)
         return payload
 
     @property
@@ -161,6 +172,8 @@ class JobManifest:
     error: str | None = None
     pr_url: str | None = None
     result_path: str | None = None
+    target_files: tuple[str, ...] = ()
+    documentation: dict[str, str] | None = None
 
     @classmethod
     def from_request(cls, request: JobRequest) -> "JobManifest":
@@ -172,6 +185,7 @@ class JobManifest:
             preflight=request.preflight.strip(),
             requested_publish=request.publish,
             policy=request.policy.strip(),
+            target_files=request.target_files,
         )
 
     def evolve(self, **changes: object) -> "JobManifest":
@@ -212,6 +226,7 @@ class JobManifest:
     @classmethod
     def from_storage_dict(cls, data: dict[str, Any]) -> "JobManifest":
         copied = dict(data)
+        copied["target_files"] = tuple(copied.get("target_files", ()))
         copied["state"] = JobState(copied["state"])
         if copied.get("validation") is not None:
             copied["validation"] = ValidationResult.from_dict(copied["validation"])

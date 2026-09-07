@@ -2,7 +2,7 @@
 
 Poo-IA es un asistente personal que usa Discord como primera interfaz. Escucha mensajes normales, sin prefijo `!`, exclusivamente en un canal y para un propietario configurados. Mantiene memoria entre reinicios, consulta la documentación de Capnet y puede preparar cambios pequeños mediante Codex CLI en worktrees aislados.
 
-La integración con AWS y DynamoDB está deliberadamente desactivada en esta fase. El sistema principal no instala AWS CLI, no necesita un perfil AWS y no lee, copia ni modifica credenciales AWS.
+El worker permite consultas AWS de solo lectura cuando se activa explícitamente. AWS CLI y el perfil permanecen en el host; el núcleo no recibe claves. La validación automática de repositorios Python con uv se ejecuta en contenedores separados, sin red ni credenciales.
 
 ## Arquitectura
 
@@ -40,7 +40,7 @@ El repositorio está organizado así:
 ```text
 app/          Núcleo, Discord, memoria, SQLite, router y clientes HTTP
 worker/       Worker local de Codex, Git, validación y GitHub
-rules/        Reglas editables de memoria, investigación, cambios y AWS futuro
+rules/        Reglas editables de memoria, investigación, cambios y consultas AWS
 personality/  Voz y personalidad de Poo-IA
 opencode/     Configuración del investigador documental de solo lectura
 ops/          Servicios systemd y ejemplo privado del worker
@@ -48,7 +48,19 @@ docs/         Diseño, plan y manual operativo
 tests/        Pruebas sin depender de Discord, Ollama, Codex o GitHub reales
 ```
 
-Los repositorios que puede modificar el worker no viven dentro de Poo-IA. Son hijos directos de `/home/poo/capnet-workspace`; `brain-capnet` es uno de ellos. Los cambios se crean fuera de sus checkouts base, bajo `/home/poo/capnet-worktrees`. OpenCode no recibe esos checkouts: antes de arrancar se genera `/home/poo/capnet-research-view` únicamente con archivos de texto permitidos de cada `HEAD` confirmado en Git, sin metadatos `.git`, archivos no rastreados ni material detectado como secreto.
+Los repositorios de ejecución no viven dentro de Poo-IA: son hijos directos de `/home/poo/capnet-workspace`, excluyendo `brain-capnet`, que se reserva para conocimiento y bitácoras. Los cambios se crean fuera de sus checkouts base, bajo `/home/poo/capnet-worktrees`. OpenCode no recibe esos checkouts: antes de arrancar se genera `/home/poo/capnet-research-view` únicamente con archivos de texto permitidos de cada `HEAD` confirmado en Git, sin metadatos `.git`, archivos no rastreados ni material detectado como secreto.
+
+### Brain, ejecución y regreso documental
+
+`brain-capnet` contiene conocimiento de referencia y queda excluido de los destinos de cambios de código y PR de servicios. Citar sus archivos no establece un repositorio de ejecución. Los nombres de servicios explícitos prevalecen sobre la memoria; `task`, `tasks`, `tarea` y `tareas` se resuelven a `capnet-next-lambda-tasks` cuando está disponible. El worker repite esta comprobación para rechazar solicitudes directas o históricas que apunten al brain.
+
+El flujo es **consulta del brain → repositorio de ejecución → cambio y PR solicitado → bitácora separada del brain**. El preflight devuelve JSON con `repository`, `status`, `files`, `notes` y `missing_information`. Un resultado incompleto o con repositorio diferente detiene la ejecución antes de Codex. Los archivos candidatos se verifican dentro del worktree real, incluyendo enlaces simbólicos. Las preguntas de capacidades las responde el núcleo; `edita/editar` se reconoce como cambio cuando expresa una orden concreta.
+
+Al preparar el resultado y al publicar su PR, el worker escribe `Procesos/Poo-IA/<job_id>.md` en un worktree del brain llamado `brain-docs-<job_id>`, rama `poo-ia/docs-<job_id>`. La bitácora contiene estado, repositorio, rama, commit base, medición, validación y URL del PR. No contiene prompts, políticas, código ni salidas completas del modelo. Una repetición actualiza el mismo documento y el diff del servicio nunca incluye la bitácora.
+
+La bitácora queda **preparada y pendiente de integrar al brain**: no se hace commit, push ni PR documental automáticamente. Hasta que se integre en el `HEAD` del brain y se reconstruya la vista documental, OpenCode no verá ese registro. Solo `Procesos/Poo-IA/*.md` se incorpora a las rutas documentales permitidas; el resto de `Procesos` permanece fuera. La respuesta del bot distingue la ejecución del estado documental, y un fallo al documentar no convierte un cambio preparado o un PR publicado en fallo de ejecución.
+
+La migración 003 elimina el antiguo contexto que apuntaba al brain conservando los trabajos históricos. El registro histórico que aparece como exitoso con cero cambios no se reclasifica ni se publica automáticamente.
 
 ## Comportamiento en Discord
 
@@ -382,7 +394,7 @@ sudo loginctl enable-linger poo
 | `WORKER_SERVER_PASSWORD` | Con worker | Secreto de al menos 16 caracteres compartido con `WORKER_PASSWORD`. |
 | `WORKER_TIMEOUT_SECONDS` | No | Timeout de cada llamada HTTP; por defecto 30 s. |
 | `WORKER_POLL_SECONDS` | No | Intervalo de consulta de trabajos; por defecto 2 s. |
-| `AWS_ENABLED` | No | Su valor predeterminado es `false`; `true` impide iniciar por diseño. |
+| `AWS_ENABLED` | No | Por defecto `false`; activa consultas de solo lectura mediante el worker. Requiere `WORKER_ENABLED=true` y activación también en `worker.env`. |
 
 Las variables internas del worker, sus límites y rutas están explicados en [docs/operations.md](docs/operations.md).
 
@@ -395,7 +407,7 @@ Las variables internas del worker, sus límites y rutas están explicados en [do
 - El checkout base debe estar limpio y no cambia de rama ni recibe commits.
 - Codex trabaja en `/home/poo/capnet-worktrees/<job_id>` sobre una rama `poo-ia/...`.
 - En esta primera fase de un solo propietario, Codex usa el acceso del usuario `poo`; el worktree aislado, el presupuesto de diff y la revisión previa al PR son los límites operativos.
-- La ejecución automática de comandos de prueba del repositorio permanece deshabilitada hasta contar con una sandbox dedicada; por ahora la validación se informa como `unavailable`.
+- Con `VALIDATION_ENABLED=true`, las pruebas de proyectos uv se ejecutan automáticamente en Docker con Python y dependencias del proyecto, sin red y sobre una copia efímera del código. Un entorno no compatible se informa como `unavailable`; nunca se ejecutan pruebas en el host como alternativa.
 - Un diff fuera de presupuesto bloquea la publicación hasta una autorización posterior que identifique el trabajo y pida forzarla.
 
 Los límites no borran el resultado: el trabajo queda `prepared` para inspección. Los reintentos con el mismo ID son idempotentes; no crean otra ejecución, rama o PR.
@@ -431,11 +443,19 @@ codex login status
 gh auth status
 ```
 
-## AWS queda fuera de esta fase
+## Consultas AWS de solo lectura
 
-No añadas `AWS_PROFILE`, `AWS_REGION`, claves ni archivos de credenciales para validar esta entrega. Las solicitudes sobre AWS o DynamoDB reciben una respuesta determinista que indica que la integración está pospuesta.
+Activa `AWS_ENABLED=true` en `.env` y en el archivo privado `worker.env`. El núcleo requiere el worker autenticado. Solo el worker ejecuta AWS CLI con el perfil del usuario del servidor; las claves permanecen en `~/.aws/credentials` y no se montan en el núcleo ni en los contenedores de pruebas.
 
-Cuando el propietario abra esa fase, el worker usará la cadena estándar de credenciales del usuario `poo` y exactamente los permisos de su identidad configurada. Ese trabajo posterior añadirá verificación con STS, operaciones DynamoDB paginadas e informes; no requiere cambiar la autenticación actual de Discord, memoria, OpenCode o Codex.
+AWS se limita a DynamoDB y CloudWatch Logs. Permite listar y describir tablas, consultar una muestra acotada de registros de una tabla explícita, listar grupos de logs y leer eventos recientes de un grupo explícito. El endpoint autenticado `/v1/aws/query` acepta acciones predefinidas, nunca comandos libres. Las respuestas muestran campos seleccionados y avisan si el listado está limitado. Las lecturas de registros evalúan como máximo diez elementos; los logs se limitan a veinte eventos de la última hora, con texto acotado. No hay operaciones de escritura. Una modificación requiere una instrucción explícita adicional y no se ejecuta por activar las consultas. Las respuestas AWS no se incorporan a la memoria conversacional ni se envían a modelos.
+
+Ejemplos: `lista las tablas DynamoDB`, `describe la tabla DynamoDB nombre-tabla`, `consulta registros de la tabla nombre-tabla en DynamoDB`, `lista grupos de CloudWatch`, `ver logs del grupo /aws/lambda/servicio en CloudWatch`.
+
+Agrega `en csv` para recibir un archivo adjunto descargable: `consulta registros de la tabla nombre-tabla en DynamoDB en csv` o `ver logs del grupo /aws/lambda/servicio en CloudWatch en csv`. También puedes pedir `dámelo en csv` después de una consulta: se repite la última consulta explícita entre las diez solicitudes AWS satisfactorias más recientes de esa misma conversación y se avisa que son datos actuales. `olvida la conversación` elimina ese contexto para futuras exportaciones.
+
+El archivo usa UTF-8 con BOM, conserva las celdas completas y tiene un máximo de 128 KiB. Mantiene los límites de consulta (10 registros evaluados, 20 eventos de la última hora o 25 recursos), e indica resultados parciales; no exporta toda la tabla ni el historial completo. Los atributos DynamoDB forman columnas, los valores anidados se representan como JSON y sus números se conservan como cadenas para no perder precisión. Se neutralizan fórmulas en cadenas y encabezados y se ocultan patrones comunes de credenciales. Si el archivo supera el límite o hay columnas que colisionan tras esa protección, la operación falla sin entregar un CSV recortado.
+
+El CSV se guarda en SQLite junto con la respuesta pendiente y se adjunta a su primera parte. Los reintentos de entrega reutilizan esos bytes, sin ejecutar otra consulta AWS ni enviar el contenido a modelos. La migración `004_outbox_attachments.sql` incorpora este almacenamiento y elimina los adjuntos cuando vence la retención de su respuesta entregada.
 
 ## Secretos y datos privados
 

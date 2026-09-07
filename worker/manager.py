@@ -23,6 +23,7 @@ from .publication import (
 from .repositories import RepositoryResolver
 from .retention import RetentionReaper, RetentionReport
 from .store import ManifestStateError, ManifestStore
+from .validation_sandbox import DockerValidationRunner
 
 
 LOGGER = logging.getLogger(__name__)
@@ -67,10 +68,20 @@ class JobManager:
         self._last_retention_report: RetentionReport | None = None
         self._last_retention_failed = False
         self._retention_task: asyncio.Task[RetentionReport] | None = None
+        self._validation_sandbox = (
+            DockerValidationRunner(
+                staging_root=settings.data_root / "validation",
+                docker_executable=settings.docker_executable,
+                build_timeout_seconds=settings.validation_build_timeout_seconds,
+            )
+            if settings.validation_enabled else None
+        )
 
     async def start(self) -> None:
         if self._dispatcher is None:
             self._closing = False
+            if self._validation_sandbox is not None:
+                await asyncio.to_thread(self._validation_sandbox.cleanup_orphans)
             self._dispatcher = asyncio.create_task(
                 self._dispatch_loop(), name="poo-ia-worker-dispatcher"
             )
@@ -106,7 +117,8 @@ class JobManager:
         return manifest
 
     async def repository_names(self) -> tuple[str, ...]:
-        return await asyncio.to_thread(self.repositories.clean_names)
+        from app.repository_scope import execution_repositories
+        return execution_repositories(await asyncio.to_thread(self.repositories.clean_names))
 
     async def cancel(self, job_id: str) -> JobManifest:
         current = self.store.get(job_id)
@@ -143,6 +155,7 @@ class JobManager:
                 and self.processes.is_job_process(current.process_pid, current.job_id)
             ):
                 self.processes.terminate_group(current.process_pid)
+            await self._cleanup_validation(current)
             # Stop the external Git/GitHub process before releasing its durable
             # claim. If it completed first, return that actual terminal result
             # (including its PR URL) instead of overwriting it with PREPARED.
@@ -178,7 +191,19 @@ class JobManager:
         ):
             self.processes.terminate_group(current.process_pid)
         self._wake.set()
+        await self._cleanup_validation(current)
         return updated
+
+    async def _cleanup_validation(self, manifest: JobManifest) -> None:
+        if self._validation_sandbox is None:
+            return
+        paths = [self.store.root / manifest.job_id / "baseline"]
+        if manifest.worktree:
+            path = Path(manifest.worktree).resolve()
+            if path.is_relative_to(self.settings.worktrees_root.resolve()):
+                paths.append(path)
+        for path in paths:
+            await asyncio.to_thread(self._validation_sandbox.cleanup_for_repository, path)
 
     async def publish(
         self, job_id: str, *, override: bool = False
@@ -186,6 +211,9 @@ class JobManager:
         """Durably queue publication and return without waiting for Git or GitHub."""
         async with self._publish_lock:
             current = self.store.get(job_id)
+            from app.repository_scope import is_documentation_repository
+            if is_documentation_repository(current.repository):
+                raise ManifestStateError("El brain es documental y no recibe PR de ejecución.")
             if current.pr_url or current.state is JobState.SUCCEEDED:
                 return current, False
             if current.state is JobState.PUBLISHING:
@@ -232,6 +260,8 @@ class JobManager:
             "queue_depth": counts[JobState.QUEUED.value],
             "states": counts,
             "manifest_errors": len(scan.failures),
+            "validation": {"enabled": self.settings.validation_enabled, "backend": "docker-uv"},
+            "aws": {"enabled": self.settings.aws_enabled, "mode": "read-only"},
             "retention": {
                 "last_deleted": (
                     len(self._last_retention_report.deleted)
@@ -292,6 +322,8 @@ class JobManager:
                 # Re-read once to avoid overwriting the child's final atomic update.
                 await asyncio.sleep(0)
                 latest = self.store.get(active.job_id)
+                if latest.state in {JobState.RUNNING, JobState.PUBLISHING}:
+                    await self._cleanup_validation(latest)
                 if (
                     latest.state is JobState.PREPARED
                     and latest.requested_publish

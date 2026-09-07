@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from unittest.mock import patch
 from app.memory import MemoryStore
 from app.models import (
     ConversationKey,
+    CsvAttachment,
     InboundMessage,
     Intent,
     JobKind,
@@ -43,6 +45,7 @@ class FakeOpenCode:
     def __init__(self, response: str = "resultado documental con ruta/file.py") -> None:
         self.response = response
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.preflight_response: str | None = None
         self.active_session_id: str | None = None
         self.maximum_active = 0
         self._active = 0
@@ -73,6 +76,14 @@ class FakeOpenCode:
                 await self.release.wait()
             if self.research_error_after_session is not None:
                 raise self.research_error_after_session
+            if prompt.startswith("Prepara un preflight"):
+                return self.preflight_response or json.dumps({
+                    "repository": kwargs.get("active_repository"),
+                    "status": "ready",
+                    "files": ["schemas/base_response.py"],
+                    "notes": "Archivo de tareas verificado.",
+                    "missing_information": [],
+                })
             return self.response
         finally:
             self._active -= 1
@@ -93,12 +104,22 @@ class FakeOpenCode:
 
 class FakeWorker:
     def __init__(self) -> None:
+        self.aws_calls: list[tuple[str, str | None, str | None]] = []
+        self.aws_formats: list[str] = []
         self.create_calls: list[dict[str, object]] = []
         self.get_calls: list[str] = []
         self.cancel_calls: list[str] = []
         self.publish_calls: list[tuple[str, bool]] = []
         self.polls: dict[str, list[dict[str, object]]] = {}
         self.cancel_result: dict[str, object] | None = None
+
+    async def query_aws(self, action: str, *, table: str | None = None, log_group: str | None = None, output_format: str = "text"):
+        self.aws_calls.append((action, table, log_group))
+        self.aws_formats.append(output_format)
+        if output_format == "csv":
+            return {"state": "succeeded", "message": "CSV adjunto: hasta 10 registros.",
+                    "attachment": CsvAttachment("dynamodb.csv", b"task_id,task_available\r\n1,true\r\n")}
+        return {"state": "succeeded", "message": "Tabla Tasks: ACTIVE (metadatos)."}
 
     async def create_codex_job(self, **kwargs: object):
         self.create_calls.append(dict(kwargs))
@@ -529,6 +550,78 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             self.worker.create_calls[-1]["repository"],
             "capnet-next-lambda-tasks",
         )
+
+    async def test_brain_research_never_becomes_execution_context(self) -> None:
+        self.opencode.response = "La guía está en brain-capnet/ai/rutas-de-consulta.md"
+        await self.orchestrator.handle(InboundMessage(120, 100, 200, "investiga la guía documental"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertIsNone(self.storage.get_conversation(KEY).active_repository)
+        submission = await self.orchestrator.handle(InboundMessage(
+            121, 100, 200,
+            "Hola necesito agregar este campo task_available de tipo boleando en task, y que todo sea por defecto como true",
+        ))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.storage.get_job(submission.job_id).state, JobStatus.PREPARED)
+        self.assertEqual(self.worker.create_calls[-1]["repository"], "capnet-next-lambda-tasks")
+
+    async def test_preflight_repository_mismatch_never_reaches_worker(self) -> None:
+        self.opencode.preflight_response = json.dumps({
+            "repository": "brain-capnet", "status": "ready", "files": ["README.md"],
+            "notes": "La evidencia contradice el destino", "missing_information": [],
+        })
+        submission = await self.orchestrator.handle(InboundMessage(
+            122, 100, 200, "agrega un campo en capnet-next-lambda-tasks",
+        ))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.worker.create_calls, [])
+        self.assertEqual(self.storage.get_job(submission.job_id).state, JobStatus.FAILED)
+
+    async def test_dependency_citation_cannot_replace_explicit_execution_target(self) -> None:
+        self.opencode.response = "Depende del código customer-service/models.py."
+        await self.orchestrator.handle(InboundMessage(127, 100, 200, "investiga tasks"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.storage.get_conversation(KEY).active_repository, "capnet-next-lambda-tasks")
+        await self.orchestrator.handle(InboundMessage(128, 100, 200, "agrega el campo example sin investigar"))
+        await self.orchestrator.scheduler.wait_idle(timeout=2)
+        self.assertEqual(self.worker.create_calls[-1]["repository"], "capnet-next-lambda-tasks")
+
+    async def test_capabilities_are_answered_by_core_without_read_only_research(self) -> None:
+        submission = await self.orchestrator.handle(InboundMessage(123, 100, 200, "Ya puedes editar?"))
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.opencode.calls, [])
+        sent = " ".join(await self.flush_all())
+        self.assertIn("repositorio de ejecución", sent)
+        self.assertIn("brain", sent)
+
+    async def test_failed_job_notification_includes_actual_codex_explanation(self) -> None:
+        registration = self.storage.register_inbound(
+            InboundMessage(124, 100, 200, "agrega campo"), job_kind=JobKind.CODEX,
+            repository="capnet-next-lambda-tasks", payload={},
+        )
+        self.storage.transition_job(registration.job.job_id, JobStatus.RUNNING)
+        failed = self.storage.transition_job(
+            registration.job.job_id, JobStatus.FAILED,
+            summary="Falta el archivo schemas/base_response.py en este worktree.",
+            safe_error="Codex completed but produced no repository changes",
+        )
+        await self.orchestrator._on_job_finished(failed)
+        sent = " ".join(await self.flush_all())
+        self.assertIn("Falta el archivo", sent)
+        self.assertIn("capnet-next-lambda-tasks", sent)
+
+    async def test_pr_for_other_explicit_repository_never_publishes_active_job(self) -> None:
+        registration = self.storage.register_inbound(
+            InboundMessage(125, 100, 200, "agrega campo"), job_kind=JobKind.CODEX,
+            repository="capnet-next-lambda-tasks", payload={},
+        )
+        self.storage.transition_job(registration.job.job_id, JobStatus.RUNNING)
+        self.storage.transition_job(registration.job.job_id, JobStatus.PREPARED)
+        submission = await self.orchestrator.handle(InboundMessage(
+            126, 100, 200, f"arma el PR del trabajo {registration.job.job_id} en customer-service",
+        ))
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.worker.publish_calls, [])
+        self.assertIn("otro repositorio", " ".join(await self.flush_all()))
 
     async def test_combined_change_and_pr_after_research_starts_new_codex_job(self) -> None:
         self.opencode.response = (
@@ -1017,6 +1110,148 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(snapshot.conversation.active_repository)
         self.assertIsNone(snapshot.conversation.last_job_id)
 
+    async def test_aws_csv_is_durable_idempotent_and_excluded_from_memory(self) -> None:
+        self.orchestrator.aws_enabled = True
+        message = InboundMessage(960, 100, 200, "consulta registros de la tabla Tasks en DynamoDB en csv")
+        submission = await self.orchestrator.handle(message)
+        await self.orchestrator.handle(message)
+        self.assertEqual(self.worker.aws_calls, [("scan-dynamodb", "Tasks", None)])
+        self.assertEqual(self.worker.aws_formats, ["csv"])
+        pending = self.outbox.pending(KEY)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0].attachment.filename, "dynamodb.csv")
+        self.assertIn(b"task_available", pending[0].attachment.data)
+        await self.flush_all()
+        self.assertEqual(self.storage.get_inbound(submission.request_id).status, RequestStatus.COMPLETED)
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_csv_followup_requeries_same_resource_and_discloses_fresh_read(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(961, 100, 200, "ver logs del grupo /aws/lambda/Prod en CloudWatch"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(962, 100, 200, "dámelo en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("read-logs", None, "/aws/lambda/Prod"))
+        self.assertEqual(self.worker.aws_formats, ["text", "csv"])
+        self.assertIn("Volví a consultar", " ".join(await self.flush_all()))
+        await self.orchestrator.handle(InboundMessage(963, 100, 200, "en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("read-logs", None, "/aws/lambda/Prod"))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_csv_followup_cannot_cross_conversations_or_forgotten_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(964, 100, 200, "lista tablas DynamoDB"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(965, 101, 200, "dámelo en csv"))
+        await self.orchestrator.handle(InboundMessage(966, 100, 201, "dámelo en csv"))
+        self.assertEqual(len(self.worker.aws_calls), 1)
+        await self.orchestrator.handle(InboundMessage(967, 100, 200, "olvida la conversación"))
+        await self.flush_all()
+        await self.orchestrator.handle(InboundMessage(968, 100, 200, "dámelo en csv"))
+        self.assertIn("No encontré una consulta AWS", " ".join(await self.flush_all()))
+        self.assertEqual(len(self.worker.aws_calls), 1)
+        self.assertEqual(self.opencode.calls, [])
+
+    async def test_csv_followup_skips_failed_queries_and_help(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(969, 100, 200, "lista tablas DynamoDB"))
+        await self.flush_all()
+        original = self.worker.query_aws
+        async def failed_query(*args, **kwargs):
+            return {"state": "failed", "message": "Sin acceso"}
+        self.worker.query_aws = failed_query
+        await self.orchestrator.handle(InboundMessage(970, 100, 200, "describe la tabla Other en DynamoDB"))
+        self.worker.query_aws = original
+        await self.orchestrator.handle(InboundMessage(971, 100, 200, "consulta AWS"))
+        await self.orchestrator.handle(InboundMessage(972, 100, 200, "dámelo en csv"))
+        self.assertEqual(self.worker.aws_calls[-1], ("list-dynamodb", None, None))
+
+    async def test_csv_success_without_attachment_is_an_error(self) -> None:
+        self.orchestrator.aws_enabled = True
+        async def missing(*args, **kwargs):
+            return {"state": "succeeded", "message": "CSV listo"}
+        self.worker.query_aws = missing
+        submission = await self.orchestrator.handle(InboundMessage(973, 100, 200, "lista tablas DynamoDB en csv"))
+        self.assertEqual(self.storage.get_inbound(submission.request_id).status, RequestStatus.FAILED)
+        self.assertIsNone(self.outbox.pending(KEY)[0].attachment)
+        self.assertIn("No pude", " ".join(await self.flush_all()))
+
+    async def test_aws_runs_only_on_host_and_never_enters_model_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        submission = await self.orchestrator.handle(InboundMessage(
+            930, 100, 200, "describe la tabla Tasks en DynamoDB"
+        ))
+        self.assertEqual(submission.intent, Intent.AWS_REPORT)
+        self.assertIsNone(submission.job_id)
+        self.assertEqual(self.worker.aws_calls, [("describe-dynamodb", "Tasks", None)])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(await self.flush_all(), ["Tabla Tasks: ACTIVE (metadatos)."])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertIsNone(self.storage.get_conversation(KEY).active_repository)
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_duplicate_aws_request_is_idempotent_and_preserves_execution_context(self) -> None:
+        self.orchestrator.aws_enabled = True
+        self.storage.set_conversation_context(KEY, active_repository="capnet-next-lambda-tasks")
+        message = InboundMessage(933, 100, 200, "lista tablas de DynamoDB")
+        first = await self.orchestrator.handle(message)
+        await self.flush_all()
+        duplicate = await self.orchestrator.handle(message)
+        self.assertTrue(first.created)
+        self.assertFalse(duplicate.created)
+        self.assertEqual(self.worker.aws_calls, [("list-dynamodb", None, None)])
+        self.assertEqual(await self.flush_all(), [])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.storage.get_conversation(KEY).active_repository, "capnet-next-lambda-tasks")
+
+    async def test_record_and_log_reads_stay_out_of_models_memory_and_brain(self) -> None:
+        self.orchestrator.aws_enabled = True
+        for message_id, text in ((936, "consulta registros de la tabla Tasks en DynamoDB"), (937, "ver logs del grupo /aws/lambda/tasks en CloudWatch")):
+            await self.orchestrator.handle(InboundMessage(message_id, 100, 200, text))
+            await self.flush_all()
+        self.assertEqual(self.worker.aws_calls, [("scan-dynamodb", "Tasks", None), ("read-logs", None, "/aws/lambda/tasks")])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertEqual(self.ollama.prompts, [])
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+        self.assertEqual(self.storage.list_jobs(), [])
+
+    async def test_identity_and_lambda_requests_do_not_reach_worker(self) -> None:
+        self.orchestrator.aws_enabled = True
+        for message_id, text in ((938, "consulta mi identidad AWS"), (939, "lista las lambdas")):
+            await self.orchestrator.handle(InboundMessage(message_id, 100, 200, text))
+            self.assertIn("DynamoDB y CloudWatch", " ".join(await self.flush_all()))
+        self.assertEqual(self.worker.aws_calls, [])
+
+    async def test_capabilities_announce_aws_only_when_enabled(self) -> None:
+        await self.orchestrator.handle(InboundMessage(934, 100, 200, "¿Qué puedes hacer?"))
+        self.assertNotIn("consultar DynamoDB", " ".join(await self.flush_all()))
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(935, 100, 200, "¿Qué puedes hacer?"))
+        self.assertIn("consultar DynamoDB", " ".join(await self.flush_all()))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_aws_unsupported_requests_explain_allowlist_without_a_model(self) -> None:
+        self.orchestrator.aws_enabled = True
+        await self.orchestrator.handle(InboundMessage(931, 100, 200, "elimina todas las tablas de DynamoDB"))
+        self.assertEqual(self.worker.aws_calls, [])
+        self.assertEqual(self.opencode.calls, [])
+        self.assertIn("Operaciones disponibles", " ".join(await self.flush_all()))
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
+    async def test_aws_transport_failure_never_echoes_raw_error(self) -> None:
+        self.orchestrator.aws_enabled = True
+        async def fail(*args, **kwargs):
+            raise RuntimeError("raw-credential-value")
+        self.worker.query_aws = fail
+        await self.orchestrator.handle(InboundMessage(932, 100, 200, "lista tablas de DynamoDB"))
+        text = " ".join(await self.flush_all())
+        self.assertNotIn("raw-credential-value", text)
+        self.assertIn("No pude", text)
+        self.assertEqual(self.memory.snapshot(KEY).exchanges, ())
+
     async def test_aws_is_explicitly_disabled_without_touching_worker(self) -> None:
         result = await self.orchestrator.handle(
             InboundMessage(14, 100, 200, "haz un reporte de DynamoDB")
@@ -1024,7 +1259,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         sent = await self.flush_all()
 
         self.assertEqual(result.intent, Intent.AWS_REPORT)
-        self.assertTrue(any("pospuesta" in text for text in sent))
+        self.assertTrue(any("desactivadas" in text for text in sent))
         self.assertEqual(self.worker.create_calls, [])
 
     async def test_wait_for_output_observes_background_completion(self) -> None:

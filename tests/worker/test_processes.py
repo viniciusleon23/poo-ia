@@ -24,6 +24,16 @@ def process_exists(pid: int) -> bool:
 
 
 class SubprocessCommandRunnerTests(unittest.TestCase):
+    def test_explicit_environment_does_not_inherit_host_values(self) -> None:
+        runner = SubprocessCommandRunner(environment={"ALLOWED_CANARY": "present", "WORKER_PASSWORD": "also-removed"})
+        with mock.patch.dict(os.environ, {"DENIED_CANARY": "must-not-leak", "AWS_SECRET_ACCESS_KEY": "synthetic-key"}):
+            result = runner.run((
+                sys.executable, "-c",
+                "import os; print(os.getenv('ALLOWED_CANARY')); print(os.getenv('DENIED_CANARY')); print(os.getenv('AWS_SECRET_ACCESS_KEY')); print(os.getenv('WORKER_PASSWORD'))",
+            ), timeout=5)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), ["present", "None", "None", "None"])
+
     def test_external_commands_do_not_inherit_worker_password(self) -> None:
         runner = SubprocessCommandRunner()
         with mock.patch.dict(os.environ, {"WORKER_PASSWORD": "must-not-leak"}):

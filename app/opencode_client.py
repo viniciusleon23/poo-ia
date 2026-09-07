@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -225,6 +226,28 @@ class OpenCodeClient:
     def _extract_text(result: object) -> str:
         if not isinstance(result, dict):
             raise OpenCodeError("OpenCode returned an unexpected response body.")
+
+        info = result.get("info")
+        if isinstance(info, dict):
+            error = info.get("error")
+            if error is not None:
+                # Provider payloads may contain credentials or response bodies.
+                # Preserve a bounded error type, never relay the raw payload.
+                name = error.get("name") if isinstance(error, dict) else None
+                kind = (
+                    f" ({name})"
+                    if isinstance(name, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name)
+                    else ""
+                )
+                raise OpenCodeError(
+                    f"OpenCode reportó un error{kind}; la investigación no se completó."
+                )
+            if info.get("finish") == "length":
+                raise OpenCodeError(
+                    "OpenCode devolvió una respuesta incompleta por límite de generación."
+                )
+            if info.get("finish") == "error":
+                raise OpenCodeError("OpenCode terminó con error; la investigación no se completó.")
 
         parts: Any = result.get("parts")
         if not isinstance(parts, list):

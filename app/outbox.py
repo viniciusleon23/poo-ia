@@ -6,7 +6,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .models import Backend, ConversationKey, OutboxMessage, OutboxPart
+from .models import Backend, ConversationKey, CsvAttachment, OutboxMessage, OutboxPart
 from .storage import SQLiteStorage
 from .text import DISCORD_SAFE_MESSAGE_LIMIT, split_for_discord
 
@@ -46,6 +46,7 @@ class DurableOutbox:
         kind: str = "response",
         dedupe_key: str = "final",
         remember_exchange: bool = True,
+        attachment: CsvAttachment | None = None,
         now: float | None = None,
     ) -> OutboxMessage:
         """Idempotently enqueue a complete, already generated output."""
@@ -62,6 +63,7 @@ class DurableOutbox:
             parts=parts,
             backend=backend,
             exchange_on_complete=remember_exchange,
+            attachment=attachment,
             now=timestamp,
         )
 

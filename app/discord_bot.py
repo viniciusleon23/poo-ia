@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from io import BytesIO
 
 import aiohttp
 import discord
@@ -172,6 +173,7 @@ class PooIAClient(discord.Client):
             content_root=self.settings.content_root,
             opencode=self._opencode,
             worker=self._worker,
+            aws_enabled=self.settings.aws_enabled,
             repositories=repositories,
             worker_poll_seconds=self.settings.worker_poll_seconds,
         )
@@ -350,4 +352,15 @@ class PooIAClient(discord.Client):
         sender = getattr(channel, "send", None)
         if sender is None:
             raise RuntimeError(f"Discord channel {channel_id} cannot receive messages.")
+        if part.attachment is not None:
+            if part.part_index != 0:
+                raise ValueError("Only the first Discord output part may carry a CSV attachment.")
+            with BytesIO(part.attachment.data) as buffer:
+                upload = discord.File(buffer, filename=part.attachment.filename)
+                try:
+                    return await sender(
+                        part.content, file=upload, allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                finally:
+                    upload.close()
         return await sender(part.content)

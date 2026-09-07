@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,24 @@ class WorkerConfigurationError(ValueError):
 
 DEFAULT_OPERATIONAL_RETENTION_DAYS = 30
 DEFAULT_RETENTION_SWEEP_SECONDS = 3600.0
+
+
+def _boolean(environment: Mapping[str, str], name: str, default: bool = False) -> bool:
+    value = str(environment.get(name, "")).strip().casefold()
+    if not value:
+        return default
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise WorkerConfigurationError(f"{name} must be true or false.")
+
+
+def _aws_name(environment: Mapping[str, str], name: str, default: str) -> str:
+    value = _value(environment, name, default)
+    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", value):
+        raise WorkerConfigurationError(f"{name} contains invalid characters.")
+    return value
 
 
 def _value(environment: Mapping[str, str], name: str, default: str | None = None) -> str:
@@ -100,6 +119,14 @@ class WorkerSettings:
     poll_interval_seconds: float = 0.5
     operational_retention_days: int = DEFAULT_OPERATIONAL_RETENTION_DAYS
     retention_sweep_seconds: float = DEFAULT_RETENTION_SWEEP_SECONDS
+    validation_enabled: bool = False
+    docker_executable: str = "docker"
+    validation_build_timeout_seconds: float = 600.0
+    aws_enabled: bool = False
+    aws_executable: str = "aws"
+    aws_profile: str = "default"
+    aws_region: str = "us-east-1"
+    aws_query_timeout_seconds: float = 20.0
 
     @property
     def jobs_root(self) -> Path:
@@ -150,6 +177,18 @@ class WorkerSettings:
             codex_executable=_value(source, "CODEX_EXECUTABLE", "codex"),
             git_executable=_value(source, "GIT_EXECUTABLE", "git"),
             gh_executable=_value(source, "GH_EXECUTABLE", "gh"),
+            validation_enabled=_boolean(source, "VALIDATION_ENABLED"),
+            docker_executable=_value(source, "DOCKER_EXECUTABLE", "docker"),
+            validation_build_timeout_seconds=_positive_seconds(
+                source, "VALIDATION_BUILD_TIMEOUT_SECONDS", 600.0
+            ),
+            aws_enabled=_boolean(source, "AWS_ENABLED"),
+            aws_executable=_value(source, "AWS_CLI_EXECUTABLE", "aws"),
+            aws_profile=_aws_name(source, "AWS_PROFILE", "default"),
+            aws_region=_aws_name(source, "AWS_REGION", "us-east-1"),
+            aws_query_timeout_seconds=_positive_seconds(
+                source, "AWS_QUERY_TIMEOUT_SECONDS", 20.0
+            ),
             max_changed_files=_positive_integer(source, "CODEX_MAX_CHANGED_FILES", 5),
             max_changed_lines=_positive_integer(source, "CODEX_MAX_CHANGED_LINES", 400),
             codex_timeout_seconds=_positive_seconds(source, "CODEX_TIMEOUT_SECONDS", 1800.0),

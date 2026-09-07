@@ -6,14 +6,61 @@ from app.models import Backend, Intent
 from app.router import (
     AMBIGUOUS_REPOSITORY,
     AWS_DISABLED,
+    DOCUMENTATION_REPOSITORY_READ_ONLY,
     REPOSITORY_REQUIRED,
+    UNKNOWN_REPOSITORY,
     choose_backend,
     classify_intent,
     route_message,
+    parse_aws_query,
+    aws_csv_requested,
+    is_aws_csv_followup,
 )
 
 
 class RouterTests(unittest.TestCase):
+    def test_csv_suffix_preserves_resource_case_and_fixed_read_operation(self) -> None:
+        for text, expected in (
+            ("lista las tablas DynamoDB en csv", ("list-dynamodb", None)),
+            ("consulta registros de la tabla MixedCase-Tasks en DynamoDB en formato CSV", ("scan-dynamodb", "MixedCase-Tasks")),
+            ("ver logs del grupo /aws/lambda/Prod en CloudWatch y dámelo en csv", ("read-logs", "/aws/lambda/Prod")),
+            ("describe la tabla Tasks en DynamoDB en csv por favor", ("describe-dynamodb", "Tasks")),
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(aws_csv_requested(text))
+                self.assertEqual(parse_aws_query(text), expected)
+        self.assertIsNone(parse_aws_query("borra la tabla Tasks en DynamoDB en csv"))
+        self.assertIsNone(parse_aws_query("lista tablas DynamoDB en csv y borra todo"))
+
+    def test_csv_followups_are_narrow_and_do_not_capture_repository_changes(self) -> None:
+        for text in ("dámelo en CSV", "En csv", "regrésamelo en csv por favor", "¿y me puede regresar un csv?"):
+            self.assertTrue(is_aws_csv_followup(text))
+            self.assertIsNone(parse_aws_query(text))
+            self.assertEqual(classify_intent(text), Intent.AWS_REPORT)
+        self.assertEqual(classify_intent("agrega exportación CSV en el repo tasks"), Intent.CODE_CHANGE)
+        self.assertFalse(is_aws_csv_followup("explica cómo generar un csv"))
+
+    def test_enabled_aws_only_routes_to_host_worker(self) -> None:
+        decision = route_message("lista tablas de DynamoDB", aws_enabled=True)
+        self.assertEqual(decision.intent, Intent.AWS_REPORT)
+        self.assertEqual(decision.backend, Backend.WORKER)
+        self.assertIsNone(decision.repository)
+
+    def test_aws_queries_parse_to_static_operations(self) -> None:
+        for text, expected in (
+            ("lista tablas de DynamoDB", ("list-dynamodb", None)),
+            ("lista grupos de CloudWatch", ("list-log-groups", None)),
+            ("consulta registros de la tabla Tasks en DynamoDB", ("scan-dynamodb", "Tasks")),
+            ("ver logs del grupo /aws/lambda/tasks en CloudWatch", ("read-logs", "/aws/lambda/tasks")),
+            ("describe la tabla Tasks en DynamoDB", ("describe-dynamodb", "Tasks")),
+            ("describe la tabla DynamoDB Tasks", ("describe-dynamodb", "Tasks")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_aws_query(text), expected)
+                self.assertEqual(classify_intent(text), Intent.AWS_REPORT)
+        for text in ("borra la tabla Tasks en DynamoDB", "consulta AWS", "lista lambdas y elimina todo", "describe la tabla Tasks; rm -rf / en DynamoDB", "consulta mi identidad AWS", "lista las lambdas", "consulta registros de la tabla Tasks en DynamoDB y elimina todo"):
+            with self.subTest(text=text):
+                self.assertIsNone(parse_aws_query(text))
     def test_routes_unambiguous_small_talk_to_ollama(self) -> None:
         messages = (
             "hola",
@@ -70,6 +117,7 @@ class RouterTests(unittest.TestCase):
             "¿Cómo va a funcionar el nuevo servicio?",
             "necesito saber cómo crear un PR",
             "puedes explicarme cómo abrir un pull request",
+            "¿Qué hace el proceso que lee brain-capnet y agrega el resultado?",
         )
 
         for message in messages:
@@ -154,3 +202,77 @@ class RouterTests(unittest.TestCase):
 
         self.assertEqual(decision.intent, Intent.RESEARCH)
         self.assertEqual(decision.backend, Backend.OPENCODE)
+
+    def test_brain_context_cannot_be_reused_for_changes(self) -> None:
+        for message in ("agrega el campo task_available", "hazlo"):
+            with self.subTest(message=message):
+                decision = route_message(message, active_repository="brain-capnet")
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertIsNone(decision.repository)
+                self.assertEqual(decision.reason, REPOSITORY_REQUIRED)
+
+    def test_edits_target_execution_repo_after_brain_research(self) -> None:
+        repositories = ("brain-capnet", "capnet-next-lambda-tasks")
+        for message in (
+            "agrega task_available como booleano en task",
+            "edita schemas/base_response.py en tasks",
+            "editar el esquema en tareas",
+            "lee brain-capnet y agrega el campo en tasks",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message, active_repository="brain-capnet", repositories=repositories
+                )
+                self.assertEqual(decision.intent, Intent.CODE_CHANGE)
+                self.assertEqual(decision.repository, "capnet-next-lambda-tasks")
+
+    def test_brain_explicit_change_or_pr_is_rejected_even_with_active_job(self) -> None:
+        for message in (
+            "edita el repo brain-capnet",
+            "agrega el campo en capnet-brain",
+            "crea el PR en el repo brain-capnet",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message,
+                    active_repository="customer-service",
+                    active_job_id="prepared-123",
+                    repositories=("brain-capnet", "customer-service"),
+                )
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertEqual(decision.reason, DOCUMENTATION_REPOSITORY_READ_ONLY)
+
+    def test_new_research_repository_overrides_execution_memory(self) -> None:
+        decision = route_message(
+            "busca el modelo en tasks",
+            active_repository="customer-service",
+            repositories=("customer-service", "capnet-next-lambda-tasks"),
+        )
+        self.assertEqual(decision.intent, Intent.RESEARCH)
+        self.assertEqual(decision.repository, "capnet-next-lambda-tasks")
+        brain_only = route_message("lee brain-capnet", active_repository="brain-capnet")
+        self.assertIsNone(brain_only.repository)
+
+    def test_unknown_explicit_repo_does_not_reuse_active_job_or_repository(self) -> None:
+        for message in ("agrega campo en repo typo-service", "abre PR en repo typo-service"):
+            with self.subTest(message=message):
+                decision = route_message(
+                    message,
+                    active_repository="customer-service",
+                    active_job_id="prepared-123",
+                    repositories=("customer-service",),
+                )
+                self.assertEqual(decision.intent, Intent.CLARIFY)
+                self.assertEqual(decision.reason, UNKNOWN_REPOSITORY)
+
+    def test_capability_questions_do_not_start_research_or_mutation(self) -> None:
+        for message in (
+            "¿Ya puedes editar?",
+            "¿Puedes editar?",
+            "¿Qué puedes hacer?",
+            "¿Puedes hacer cambios?",
+        ):
+            with self.subTest(message=message):
+                decision = route_message(message, active_repository="brain-capnet")
+                self.assertEqual(decision.intent, Intent.CAPABILITIES)
+                self.assertEqual(decision.backend, Backend.STORAGE)

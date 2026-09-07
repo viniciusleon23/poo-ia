@@ -61,6 +61,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.memory_max_context_chars, DEFAULT_MEMORY_MAX_CONTEXT_CHARS)
         self.assertEqual(settings.job_max_concurrent, DEFAULT_JOB_MAX_CONCURRENT)
         self.assertFalse(settings.worker_enabled)
+        self.assertFalse(settings.aws_enabled)
         self.assertEqual(settings.worker_base_url, DEFAULT_WORKER_BASE_URL)
         self.assertEqual(settings.worker_timeout_seconds, DEFAULT_WORKER_TIMEOUT_SECONDS)
         self.assertEqual(settings.worker_poll_seconds, DEFAULT_WORKER_POLL_SECONDS)
@@ -222,9 +223,19 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigurationError, "WORKER_SERVER_PASSWORD"):
             Settings.from_environment({**self.environment, "WORKER_ENABLED": "true"})
 
-    def test_rejects_aws_and_non_single_job_concurrency(self) -> None:
+    def test_aws_requires_authenticated_worker_and_allows_activation(self) -> None:
         with self.assertRaisesRegex(ConfigurationError, "AWS_ENABLED"):
             Settings.from_environment({**self.environment, "AWS_ENABLED": "true"})
+
+        settings = Settings.from_environment({
+            **self.environment,
+            "AWS_ENABLED": "true",
+            "WORKER_ENABLED": "true",
+            "WORKER_SERVER_PASSWORD": "worker-secret-long-enough",
+        })
+        self.assertTrue(settings.aws_enabled)
+
+    def test_rejects_non_single_job_concurrency(self) -> None:
 
         with self.assertRaisesRegex(ConfigurationError, "JOB_MAX_CONCURRENT"):
             Settings.from_environment({**self.environment, "JOB_MAX_CONCURRENT": "2"})

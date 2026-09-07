@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from app.models import Backend, ConversationKey, InboundMessage
+from app.models import Backend, ConversationKey, CsvAttachment, InboundMessage
 from app.outbox import DurableOutbox
 from app.storage import SQLiteStorage, StorageConflictError
 
@@ -113,6 +113,48 @@ class OutboxTests(unittest.TestCase):
         with self.assertRaises(StorageConflictError):
             self.outbox.enqueue(request_id, "respuesta diferente")
 
+    def test_csv_is_persisted_once_on_first_part_and_never_enters_memory(self) -> None:
+        request_id = register(self.storage, 501)
+        csv = CsvAttachment("tasks.csv", b"task_id,task_available\n1,true\n")
+        envelope = self.outbox.enqueue(
+            request_id, "resultados " * 500, backend=Backend.WORKER, attachment=csv,
+        )
+        parts = self.outbox.parts(envelope.outbox_id)
+        self.assertGreater(len(parts), 1)
+        self.assertEqual(envelope.attachment, csv)
+        self.assertEqual(self.storage.get_outbox(envelope.outbox_id).attachment, csv)
+        self.assertFalse(envelope.exchange_on_complete)
+        self.assertEqual(parts[0].attachment, csv)
+        self.assertTrue(all(part.attachment is None for part in parts[1:]))
+        acknowledged = self.outbox.acknowledge(parts[0], "csv-message")
+        self.assertEqual(acknowledged.attachment, csv)
+        self.assertTrue(all(part.attachment is None for part in self.outbox.pending(KEY)))
+        for part in parts[1:]:
+            self.outbox.acknowledge(part, f"text-{part.part_index}")
+        self.assertEqual(self.storage.list_exchanges(KEY), [])
+
+    def test_attachment_bytes_and_metadata_participate_in_deduplication(self) -> None:
+        request_id = register(self.storage, 502)
+        csv = CsvAttachment("tasks.csv", b"id\n1\n")
+        first = self.outbox.enqueue(request_id, "CSV", attachment=csv)
+        self.assertEqual(first, self.outbox.enqueue(request_id, "CSV", attachment=csv))
+        for changed in (None, CsvAttachment("other.csv", csv.data), CsvAttachment(csv.filename, b"id\n2\n")):
+            with self.subTest(changed=changed):
+                with self.assertRaises(StorageConflictError):
+                    self.outbox.enqueue(request_id, "CSV", attachment=changed, remember_exchange=False)
+
+    def test_csv_value_object_rejects_unsafe_names_types_and_oversized_data(self) -> None:
+        for name in ("../tasks.csv", "/tasks.csv", "tasks\\data.csv", "tasks.csv\n", "@everyone.csv", "tasks.exe"):
+            with self.subTest(name=name):
+                with self.assertRaises(ValueError):
+                    CsvAttachment(name, b"id\n1\n")
+        with self.assertRaises(ValueError):
+            CsvAttachment("tasks.csv", b"x" * (128 * 1024 + 1))
+        with self.assertRaises(ValueError):
+            CsvAttachment("tasks.csv", b"id\n", content_type="application/octet-stream")
+        with self.assertRaises((TypeError, ValueError)):
+            CsvAttachment("tasks.csv", "id\n")
+
     def test_pending_parts_follow_output_creation_then_part_order(self) -> None:
         first_request = register(self.storage, 6)
         second_request = register(self.storage, 7)
@@ -135,6 +177,30 @@ class OutboxTests(unittest.TestCase):
 
 
 class OutboxPersistenceTests(unittest.TestCase):
+    def test_restart_retains_csv_bytes_and_ack_prevents_attachment_resend(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "poo-ia.sqlite3"
+            first = SQLiteStorage(path)
+            request_id = register(first, 503)
+            csv = CsvAttachment("tasks.csv", "id,nombre\n1,José\n".encode())
+            output = DurableOutbox(first).enqueue(request_id, "x" * 2_100, attachment=csv)
+            first.close()
+
+            second = SQLiteStorage(path)
+            outbox = DurableOutbox(second)
+            pending = outbox.pending(KEY)
+            self.assertEqual(pending[0].attachment, csv)
+            self.assertEqual(pending[0].attachment.sha256, csv.sha256)
+            outbox.acknowledge(pending[0], "file-and-first-text")
+            second.close()
+
+            third = SQLiteStorage(path)
+            remaining = DurableOutbox(third).pending(KEY)
+            self.assertEqual([part.part_index for part in remaining], [1])
+            self.assertIsNone(remaining[0].attachment)
+            self.assertFalse(third.get_outbox(output.outbox_id).is_complete)
+            third.close()
+
     def test_reopen_resumes_only_unacknowledged_parts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "poo-ia.sqlite3"
@@ -163,6 +229,31 @@ class OutboxPersistenceTests(unittest.TestCase):
 
 
 class OutboxFlushTests(unittest.IsolatedAsyncioTestCase):
+    async def test_csv_sender_failure_preserves_atomic_part_for_retry(self) -> None:
+        storage = SQLiteStorage(":memory:")
+        outbox = DurableOutbox(storage)
+        request_id = register(storage, 504)
+        csv = CsvAttachment("tasks.csv", b"id\n1\n")
+        outbox.enqueue(request_id, "Resultado CSV", attachment=csv)
+        attempts = []
+
+        async def failing_sender(part):
+            attempts.append((part.content, part.attachment))
+            raise ConnectionError("Discord upload interrupted")
+
+        with self.assertRaises(ConnectionError):
+            await outbox.flush(failing_sender, key=KEY)
+        self.assertEqual(outbox.pending(KEY)[0].attachment, csv)
+
+        async def successful_sender(part):
+            attempts.append((part.content, part.attachment))
+            return "discord-file-message"
+
+        self.assertEqual(await outbox.flush(successful_sender, key=KEY), 1)
+        self.assertEqual(attempts, [("Resultado CSV", csv), ("Resultado CSV", csv)])
+        self.assertEqual(storage.list_exchanges(KEY), [])
+        storage.close()
+
     async def test_sender_failure_leaves_current_and_later_parts_pending(self) -> None:
         storage = SQLiteStorage(":memory:")
         outbox = DurableOutbox(storage)

@@ -132,6 +132,55 @@ class OpenCodeClientTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(OpenCodeError):
                     await self.make_client(session).research("consulta")
 
+    async def test_rejects_error_metadata_even_with_partial_text_and_cleans_session(self) -> None:
+        session = FakeSession(
+            [
+                FakeResponse(200, {"id": "session-partial"}),
+                FakeResponse(200, {
+                    "info": {"error": {
+                        "name": "APIError",
+                        "data": {"message": "sensitive provider payload", "statusCode": 429},
+                    }},
+                    "parts": [{"type": "text", "text": "Ya identifiqué un archivo."}],
+                }),
+                FakeResponse(200, True),
+            ]
+        )
+
+        with self.assertRaises(OpenCodeError) as raised:
+            await self.make_client(session).research("consulta")
+
+        self.assertIn("APIError", str(raised.exception))
+        self.assertNotIn("sensitive provider payload", str(raised.exception))
+        self.assertEqual(session.calls[-1][0], "DELETE")
+
+    def test_rejects_confirmed_incomplete_finish_reasons(self) -> None:
+        for finish in ("length", "error"):
+            with self.subTest(finish=finish):
+                with self.assertRaisesRegex(OpenCodeError, "incompleta|error"):
+                    OpenCodeClient._extract_text({
+                        "info": {"finish": finish},
+                        "parts": [{"type": "text", "text": "Texto parcial."}],
+                    })
+
+    def test_unknown_finish_does_not_invent_an_error(self) -> None:
+        for finish in (None, "stop", "unknown", "provider-specific"):
+            with self.subTest(finish=finish):
+                self.assertEqual(OpenCodeClient._extract_text({
+                    "info": {"finish": finish, "error": None},
+                    "parts": [{"type": "text", "text": "Respuesta completa."}],
+                }), "Respuesta completa.")
+
+    def test_error_object_is_rejected_without_leaking_arbitrary_fields(self) -> None:
+        for error in ({}, {"name": "unsafe\nprovider-token"}, {"data": {"secret": "token"}}):
+            with self.subTest(error=error):
+                with self.assertRaises(OpenCodeError) as raised:
+                    OpenCodeClient._extract_text({
+                        "info": {"error": error},
+                        "parts": [{"type": "text", "text": "Texto parcial."}],
+                    })
+                self.assertNotIn("provider-token", str(raised.exception))
+
     async def test_maps_timeout_to_safe_error(self) -> None:
         session = FakeSession([asyncio.TimeoutError()])
 
